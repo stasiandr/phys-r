@@ -1,0 +1,14 @@
+[package]
+name = "phys-r-ffi"
+description = "C ABI for the phys-r physics engine (consumed by the Unity package)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "physr"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+phys-r = { path = "../phys-r" }

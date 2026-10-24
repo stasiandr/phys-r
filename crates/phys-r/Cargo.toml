@@ -1,0 +1,12 @@
+[package]
+name = "phys-r"
+description = "Deterministic fixed-point 3D physics engine for networked mobile FPS games"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "phys_r"
+
+[dependencies]

@@ -1,0 +1,16 @@
+{
+  "name": "com.physr.engine",
+  "version": "0.1.0",
+  "displayName": "phys-r Deterministic Physics",
+  "description": "Fast, deterministic fixed-point 3D physics (Rust) for networked mobile FPS games: rigid bodies, triangle-mesh levels, FPS character controller, raycasts, lag compensation, snapshots and state hashing.",
+  "unity": "2021.3",
+  "keywords": ["physics", "deterministic", "fixed-point", "networking", "fps", "rollback", "mobile"],
+  "author": { "name": "phys-r" },
+  "samples": [
+    {
+      "displayName": "FPS Basic",
+      "description": "Minimal first-person controller driven by the deterministic character controller.",
+      "path": "Samples~/FpsBasic"
+    }
+  ]
+}
