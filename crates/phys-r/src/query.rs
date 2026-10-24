@@ -27,6 +27,15 @@ impl Default for QueryFilter {
     }
 }
 
+/// One ray of a [`World::raycast_batch`].
+#[derive(Copy, Clone, Debug)]
+pub struct RayQuery {
+    pub origin: Vec3,
+    pub dir: Vec3,
+    pub max_dist: Fx,
+    pub filter: QueryFilter,
+}
+
 impl QueryFilter {
     pub fn mask(mask: u32) -> QueryFilter {
         QueryFilter { mask, ..Default::default() }
@@ -200,17 +209,46 @@ impl World {
             && !(f.exclude.generation != 0 && f.exclude.index == idx && f.exclude.generation == b.generation)
     }
 
+    /// Many closest-hit raycasts at once (e.g. every shot of a tick), spread
+    /// over the world's worker threads. `out[i]` receives the result of
+    /// `rays[i]`, identical to calling [`World::raycast`] for it.
+    pub fn raycast_batch(&mut self, rays: &[RayQuery], out: &mut [Option<RayHit>]) {
+        assert_eq!(rays.len(), out.len(), "raycast_batch: rays and out differ in length");
+        self.update_mover_tree();
+        if self.static_dirty {
+            self.rebuild_static();
+        }
+        const CHUNK: usize = 2;
+        let cast = |w: &World, start: usize, out: &mut [Option<RayHit>]| {
+            for (k, o) in out.iter_mut().enumerate() {
+                let r = &rays[start + k];
+                *o = w.raycast(r.origin, r.dir, r.max_dist, &r.filter);
+            }
+        };
+        #[cfg(not(target_family = "wasm"))]
+        if rays.len() > CHUNK {
+            if let Some(mut pool) = self.pool.take() {
+                let me = &*self;
+                pool.for_each_chunk_mut(out, CHUNK, &|start, o| cast(me, start, o));
+                self.pool = Some(pool);
+                return;
+            }
+        }
+        cast(self, 0, out);
+    }
+
     /// Closest hit along a ray. `dir` need not be normalised.
     pub fn raycast(&self, origin: Vec3, dir: Vec3, max_dist: Fx, filter: &QueryFilter) -> Option<RayHit> {
         let ray = Ray::new(origin, dir);
         let mut best: Option<(Fx, u32, Vec3)> = None;
         let mut max_t = max_dist;
-        let test = |idx: u32, enter: Fx, cur: Fx, best: &mut Option<(Fx, u32, Vec3)>| -> Option<Fx> {
-            let b = &self.bodies[idx as usize];
+        let test = |o: &ObRef, cur: Fx, best: &mut Option<(Fx, u32, Vec3)>| -> Option<Fx> {
+            let idx = o.body;
+            let enter = o.aabb.ray_test(&ray, cur)?;
             // Re-base the ray near the shape to keep fixed-point magnitudes small.
             let base = (enter - fx!(0.5)).max(Fx::ZERO);
             let local = Ray { origin: ray.at(base), ..ray };
-            let (t, n) = ray_shape(&self.shapes[b.shape.0 as usize], &b.iso(), &local, cur - base)?;
+            let (t, n) = ray_shape(&self.shapes[o.shape as usize], &o.iso, &local, cur - base)?;
             let t = t + base;
             if best.is_none_or(|(bt, bi, _)| t < bt || (t == bt && idx < bi)) {
                 *best = Some((t, idx, n));
@@ -218,19 +256,21 @@ impl World {
             Some(t)
         };
         if filter.include_static {
-            max_t = self.static_bvh.raycast(&ray, max_t, |idx, enter, cur| {
-                if !self.filter_accepts(idx, filter) {
+            max_t = self.static_bvh.raycast_slots(&ray, max_t, |k, cur| {
+                let o = &self.static_cols[k as usize];
+                if !self.filter_accepts(o.body, filter) {
                     return None;
                 }
-                test(idx, enter, cur, &mut best)
+                test(o, cur, &mut best)
             });
         }
         if filter.include_moving {
-            self.raycast_movers(&ray, max_t, |idx, enter, cur| {
+            self.raycast_movers(&ray, max_t, |idx, cur| {
                 if !self.filter_accepts(idx, filter) {
                     return None;
                 }
-                test(idx, enter, cur, &mut best)
+                let b = &self.bodies[idx as usize];
+                test(&ObRef { body: idx, shape: b.shape.0, iso: b.iso(), aabb: b.aabb }, cur, &mut best)
             });
         }
         best.map(|(t, idx, n)| self.make_hit(idx, &self.bodies[idx as usize].iso(), &ray, t, n))
@@ -295,9 +335,10 @@ impl World {
             out.push(ObRef { body: idx, shape: b.shape.0, iso: b.iso(), aabb: b.aabb });
         };
         if filter.include_static {
-            self.static_bvh.query_aabb(aabb, |idx| {
-                if self.filter_accepts(idx, filter) {
-                    push(idx, out);
+            self.static_bvh.query_aabb_slots(aabb, |k| {
+                let o = &self.static_cols[k as usize];
+                if self.filter_accepts(o.body, filter) {
+                    out.push(*o);
                 }
             });
         }
@@ -313,6 +354,11 @@ impl World {
 
     /// Penetration of a rounded segment into an obstacle: `(depth, push_dir)`.
     pub(crate) fn rounded_penetration(&self, a0: Vec3, a1: Vec3, r: Fx, shape: &Shape, siso: &Iso) -> Option<(Fx, Vec3)> {
+        if a0.x == a1.x && a0.z == a1.z {
+            if let Some(res) = crate::upright::penetration((a0 + a1).half(), (a1.y - a0.y).abs().shr(1), r, shape, siso) {
+                return res.filter(|(d, _)| *d > Fx::ZERO);
+            }
+        }
         let probe = if a0 == a1 { Shape::sphere(r) } else { Shape::capsule((a1 - a0).length().shr(1), r) };
         let mid = (a0 + a1).half();
         let up = (a1 - a0).normalize_or(Vec3::Y);
@@ -349,12 +395,26 @@ impl World {
         }
         let mut best: Option<(Fx, Vec3, ObRef, Vec3)> = None;
         let swept = Aabb::new(a0.min(a1), a0.max(a1)).expand(r + skin + skin).sweep(disp);
+        let up = crate::upright::UpSweep::new(a0, a1, r, disp, skin);
         for &orf in obstacles {
             if orf.body == skip || !orf.aabb.overlaps(&swept) {
                 continue;
             }
             let shape = &self.shapes[orf.shape as usize];
             let limit = best.map_or(Fx::ONE, |b| b.0);
+            // Closed-form path for upright capsules vs yaw-aligned shapes.
+            if let Some(us) = &up {
+                match crate::upright::sweep(us, shape, &orf.iso) {
+                    crate::upright::Sweep::Miss => continue,
+                    crate::upright::Sweep::Hit(t, n, p) => {
+                        if t <= limit && best.is_none_or(|b| t < b.0) {
+                            best = Some((t, n, orf, p));
+                        }
+                        continue;
+                    }
+                    crate::upright::Sweep::Unsupported => {}
+                }
+            }
             let mut t = Fx::ZERO;
             let mut hit = None;
             for _ in 0..12 {

@@ -556,7 +556,7 @@ impl World {
         self.static_dirty = true;
         self.rebuild_static();
         self.mark_movers_dirty();
-        self.rebuild_movers();
+        self.update_mover_tree();
         Ok(())
     }
 

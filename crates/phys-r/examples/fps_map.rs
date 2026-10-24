@@ -15,7 +15,8 @@ fn v(x: f64, y: f64, z: f64) -> Vec3 {
 
 fn main() {
     let t0 = Instant::now();
-    let mut w = World::new(WorldSettings::default());
+    let threads: u32 = std::env::var("THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let mut w = World::new(WorldSettings { threads, ..Default::default() });
     // Floor tiles (20 x 20 of 8 m).
     let tile = w.add_shape(Shape::cuboid(v(4.0, 0.5, 4.0)));
     for i in 0..20 {
@@ -70,11 +71,21 @@ fn main() {
     }
     w.step();
     let build = t0.elapsed();
-    println!("statics {} doors {} players {}  build {:.1} ms", n, doors.len(), players.len(), build.as_secs_f64() * 1000.0);
+    println!(
+        "statics {} doors {} players {}  threads {}  build {:.1} ms",
+        n,
+        doors.len(),
+        players.len(),
+        w.threads(),
+        build.as_secs_f64() * 1000.0
+    );
 
     let ticks: usize = std::env::var("TICKS").ok().and_then(|s| s.parse().ok()).unwrap_or(1200);
     let mut times = Vec::with_capacity(ticks);
     let mut ray_ns = 0u128;
+    let mut rays = Vec::with_capacity(32);
+    let mut hits = vec![None; 32];
+    let mut hash = 0u64;
     for t in 0..ticks {
         for (i, d) in doors.iter().enumerate() {
             w.set_door_open(*d, ((t + i * 13) / 120) % 2 == 0);
@@ -89,18 +100,23 @@ fn main() {
         let s = Instant::now();
         w.step();
         times.push(s.elapsed().as_nanos());
-        // 16 players x 2 shots per tick.
-        let s = Instant::now();
+        // 16 players x 2 shots per tick, cast as one batch.
+        rays.clear();
         for (i, c) in players.iter().enumerate() {
             let ch = w.character(*c).unwrap();
             let (sn, cs) = Fx::from_ratio(((t * 3 + i * 50) % 628) as i64, 100).sin_cos();
-            let q = QueryFilter::default().excluding(ch.body());
-            let eye = ch.position + Vec3::new(Fx::ZERO, fx!(0.7), Fx::ZERO);
-            for _ in 0..2 {
-                let _ = w.raycast(eye, Vec3::new(sn, f(-0.02), cs), f(150.0), &q);
+            let filter = QueryFilter::default().excluding(ch.body());
+            let origin = ch.position + Vec3::new(Fx::ZERO, fx!(0.7), Fx::ZERO);
+            for k in 0..2 {
+                rays.push(RayQuery { origin, dir: Vec3::new(sn, f(-0.02 - 0.01 * k as f64), cs), max_dist: f(150.0), filter });
             }
         }
+        let s = Instant::now();
+        w.raycast_batch(&rays, &mut hits);
         ray_ns += s.elapsed().as_nanos();
+        for h in &hits {
+            hash = hash.rotate_left(5) ^ h.map_or(0, |h| h.distance.0 as u64);
+        }
     }
     times.sort_unstable();
     let avg = times.iter().sum::<u128>() as f64 / ticks as f64 / 1000.0;
@@ -111,5 +127,10 @@ fn main() {
         times[ticks - 1] as f64 / 1000.0,
         ray_ns as f64 / (ticks * 32) as f64
     );
-    println!("hash {:016x}", w.state_hash());
+    println!("hash {:016x}  rays {:016x}", w.state_hash(), hash);
+    let s = Instant::now();
+    for _ in 0..2000 {
+        w.raycast_batch(&rays, &mut hits);
+    }
+    println!("raycast_batch, warm caches: {:.0} ns/ray", s.elapsed().as_nanos() as f64 / 2000.0 / rays.len() as f64);
 }

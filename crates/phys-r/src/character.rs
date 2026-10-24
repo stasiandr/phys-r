@@ -270,6 +270,32 @@ impl MoveResult {
     }
 }
 
+/// Result of [`World::compute_character`].
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct CharOut {
+    position: Vec3,
+    velocity: Vec3,
+    grounded: bool,
+    ground_normal: Vec3,
+    ground_body: BodyHandle,
+    ground_velocity: Vec3,
+    crouched: bool,
+    collision_flags: u32,
+    landing_speed: Fx,
+    air_ticks: u32,
+    jump_latched: bool,
+    pushes: [(BodyHandle, Vec3); 4],
+    np: usize,
+}
+
+/// One character's slot in a (parallel) character phase.
+#[derive(Default)]
+pub(crate) struct CharJob {
+    index: usize,
+    scratch: Vec<ObRef>,
+    out: Option<CharOut>,
+}
+
 #[derive(Copy, Clone)]
 struct Capsule {
     hh: Fx,
@@ -454,7 +480,7 @@ impl World {
             return false;
         }
         self.characters[h.index as usize].input = input;
-        self.rebuild_movers();
+        self.update_mover_tree();
         if self.static_dirty {
             self.rebuild_static();
         }
@@ -472,17 +498,46 @@ impl World {
             return;
         }
         // Mover bounds were refreshed at the end of the previous step.
-        self.rebuild_movers();
+        self.update_mover_tree();
         if self.static_dirty {
             self.rebuild_static();
         }
         let inv_dt = Fx::ONE / dt;
+        // Compute every move from the same start-of-tick world (in parallel
+        // when a pool is configured), then apply in index order.
+        let mut jobs = core::mem::take(&mut self.char_jobs);
+        jobs.retain(|_| false);
         for i in 0..self.characters.len() {
-            if !self.characters[i].alive {
-                continue;
+            if self.characters[i].alive {
+                let scratch = self.char_scratch_pool.pop().unwrap_or_default();
+                jobs.push(CharJob { index: i, scratch, out: None });
             }
+        }
+        #[cfg(not(target_family = "wasm"))]
+        let mut pool = self.pool.take();
+        {
+            let me = &*self;
+            let run = |_: usize, j: &mut CharJob| {
+                j.out = Some(me.compute_character(j.index, dt, &mut j.scratch));
+            };
+            #[cfg(not(target_family = "wasm"))]
+            match pool.as_mut() {
+                Some(p) if jobs.len() > 1 => p.for_each_mut(&mut jobs, &run),
+                _ => jobs.iter_mut().enumerate().for_each(|(k, j)| run(k, j)),
+            }
+            #[cfg(target_family = "wasm")]
+            jobs.iter_mut().enumerate().for_each(|(k, j)| run(k, j));
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.pool = pool;
+        }
+        for j in jobs.iter_mut() {
+            let i = j.index;
             let start = self.characters[i].position;
-            self.update_character(i, dt);
+            if let Some(out) = j.out.take() {
+                self.apply_character(i, &out);
+            }
             // Drive the kinematic body so the solver pushes props; the exact
             // pose is restored in `sync_character_bodies`.
             let c = &self.characters[i];
@@ -492,7 +547,10 @@ impl World {
                 b.linear_velocity = v;
                 b.angular_velocity = Vec3::ZERO;
             }
+            self.char_scratch_pool.push(core::mem::take(&mut j.scratch));
         }
+        jobs.clear();
+        self.char_jobs = jobs;
     }
 
     fn sync_character_body(&mut self, i: usize) {
@@ -513,9 +571,40 @@ impl World {
         }
     }
 
-    #[inline(never)]
+    /// Advance one character (serial path).
     fn update_character(&mut self, i: usize, dt: Fx) {
-        let c = self.characters[i].clone();
+        let mut obs = core::mem::take(&mut self.scratch_obstacles);
+        let out = self.compute_character(i, dt, &mut obs);
+        self.scratch_obstacles = obs;
+        self.apply_character(i, &out);
+    }
+
+    /// Write a computed move back (state and deferred prop pushes).
+    pub(crate) fn apply_character(&mut self, i: usize, o: &CharOut) {
+        for (h, imp) in o.pushes.iter().take(o.np) {
+            self.apply_impulse(*h, *imp, None);
+        }
+        let ch = &mut self.characters[i];
+        ch.position = o.position;
+        ch.velocity = o.velocity;
+        ch.grounded = o.grounded;
+        ch.ground_normal = o.ground_normal;
+        ch.ground_body = o.ground_body;
+        ch.ground_velocity = o.ground_velocity;
+        ch.crouched = o.crouched;
+        ch.collision_flags = o.collision_flags;
+        ch.landing_speed = o.landing_speed;
+        ch.air_ticks = o.air_ticks;
+        ch.jump_latched = o.jump_latched;
+    }
+
+    /// Compute one character's move from the start-of-tick world without
+    /// mutating anything, so all characters can run in parallel. Characters
+    /// see each other's start-of-tick bodies and prop pushes are applied
+    /// afterwards in index order: the result is independent of scheduling.
+    #[inline(never)]
+    pub(crate) fn compute_character(&self, i: usize, dt: Fx, obs: &mut Vec<ObRef>) -> CharOut {
+        let c = &self.characters[i];
         let mv = &c.desc.movement;
         let input = c.input;
         let skin = c.desc.skin;
@@ -532,15 +621,21 @@ impl World {
             let (dir, amt) = wish.normalize_with_len();
             friction(&mut v, mv, dt, true);
             accelerate(&mut v, dir, top_speed(mv, &input) * amt.min(Fx::ONE), mv.ground_accel, dt);
-            let ch = &mut self.characters[i];
-            ch.position += v.scale(dt);
-            ch.velocity = v;
-            ch.grounded = false;
-            ch.ground_body = BodyHandle::INVALID;
-            ch.ground_velocity = Vec3::ZERO;
-            ch.collision_flags = 0;
-            ch.landing_speed = Fx::ZERO;
-            return;
+            return CharOut {
+                position: c.position + v.scale(dt),
+                velocity: v,
+                grounded: false,
+                ground_normal: c.ground_normal,
+                ground_body: BodyHandle::INVALID,
+                ground_velocity: Vec3::ZERO,
+                crouched: c.crouched,
+                collision_flags: 0,
+                landing_speed: Fx::ZERO,
+                air_ticks: c.air_ticks,
+                jump_latched: c.jump_latched,
+                pushes: [(BodyHandle::INVALID, Vec3::ZERO); 4],
+                np: 0,
+            };
         }
 
         // --- Gather obstacles once for the whole move ---
@@ -548,8 +643,8 @@ impl World {
         let reach = disp_bound + c.desc.step_height + c.desc.snap_distance + skin * Fx::from_int(4) + (stand.hh - crouch.hh).abs();
         let (s0, s1) = stand.seg(c.position);
         let aabb = Aabb::new(s0.min(s1), s0.max(s1)).expand(reach + r);
-        let mut obs = core::mem::take(&mut self.scratch_obstacles);
-        self.gather_obstacles(&aabb, &filter, &mut obs);
+        self.gather_obstacles(&aabb, &filter, obs);
+        let obs: &[ObRef] = obs;
 
         let mut pos = c.position;
         let mut crouched = c.crouched;
@@ -568,7 +663,7 @@ impl World {
             let candidates = if grounded_before { [pos + h, pos + h] } else { [pos - h, pos + h] };
             let mut stood = false;
             for cand in candidates {
-                if self.capsule_fits(&obs, &stand, cand, skin) {
+                if self.capsule_fits(obs, &stand, cand, skin) {
                     pos = cand;
                     crouched = false;
                     stood = true;
@@ -626,25 +721,25 @@ impl World {
         let ground_idx = if grounded && c.ground_body.generation != 0 { c.ground_body.index } else { NO_SKIP };
 
         // --- Depenetration (pushed by movers, spawned inside geometry) ---
-        pos = self.depenetrate(&obs, &cap, pos, skin);
+        pos = self.depenetrate(obs, &cap, pos, skin);
 
         // --- Moving platform carry (ignoring the platform itself, which has
         // not moved yet this tick) ---
         if grounded && !ground_vel.is_zero() {
-            let carry = self.slide(&obs, &cap, pos, ground_vel.scale(dt), false, &c.desc, ground_idx);
+            let carry = self.slide(obs, &cap, pos, ground_vel.scale(dt), false, &c.desc, ground_idx);
             pos = carry.position;
         }
 
         // --- Move (pass A: plain slide) ---
         let disp = v.scale(dt);
-        let mut res = self.slide(&obs, &cap, pos, disp, grounded, &c.desc, NO_SKIP);
+        let mut res = self.slide(obs, &cap, pos, disp, grounded, &c.desc, NO_SKIP);
         // --- Pass B: step up and over obstacles ---
         if grounded && c.desc.step_height.0 > 0 && res.hit_count > 0 {
             let hd = Vec3::new(disp.x, Fx::ZERO, disp.z);
             let want = hd.length();
             let got_a = horiz_len(res.position - pos);
             if want.0 > 0 && got_a < want - fx!(0.001) {
-                if let Some(rb) = self.try_step(&obs, &cap, pos, hd, &c.desc, &filter) {
+                if let Some(rb) = self.try_step(obs, &cap, pos, hd, &c.desc, &filter) {
                     if horiz_len(rb.position - pos) > got_a + fx!(0.001) {
                         res = rb;
                     }
@@ -663,7 +758,7 @@ impl World {
             let probe_len = if was_grounded { c.desc.snap_distance } else { skin * Fx::from_int(3) };
             let down = Vec3::new(Fx::ZERO, -(probe_len + skin), Fx::ZERO);
             let (a0, a1) = cap.seg(pos);
-            if let Some((t, n, orf, p)) = self.sweep_rounded(&obs, a0, a1, cap.r, down, skin, NO_SKIP) {
+            if let Some((t, n, orf, p)) = self.sweep_rounded(obs, a0, a1, cap.r, down, skin, NO_SKIP) {
                 if let Some(gn) = self.walkable(&filter, p, n, c.desc.max_slope_cos) {
                     grounded = true;
                     ground_normal = gn;
@@ -726,7 +821,9 @@ impl World {
                     continue;
                 }
                 let shape = &self.shapes[orf.shape as usize];
-                if let Some((d, n, _)) = crate::collide::rounded_distance(a0, a1, cap.r, shape, &orf.iso) {
+                let dist = crate::upright::distance(pos, cap.hh, cap.r, shape, &orf.iso)
+                    .unwrap_or_else(|| crate::collide::rounded_distance(a0, a1, cap.r, shape, &orf.iso));
+                if let Some((d, n, _)) = dist {
                     let speed = c.velocity.dot(-n);
                     if d <= skin * Fx::from_int(3) && speed > Fx::ZERO {
                         let imp = (-n).scale(speed * c.desc.mass * c.desc.push_strength * dt);
@@ -736,23 +833,21 @@ impl World {
                 }
             }
         }
-        self.scratch_obstacles = obs;
-        for (h, imp) in pushes.iter().take(np) {
-            self.apply_impulse(*h, *imp, None);
+        CharOut {
+            position: pos,
+            velocity: v,
+            grounded,
+            ground_normal,
+            ground_body,
+            ground_velocity: new_ground_vel,
+            crouched,
+            collision_flags: flags_out,
+            landing_speed,
+            air_ticks,
+            jump_latched,
+            pushes,
+            np,
         }
-
-        let ch = &mut self.characters[i];
-        ch.position = pos;
-        ch.velocity = v;
-        ch.grounded = grounded;
-        ch.ground_normal = ground_normal;
-        ch.ground_body = ground_body;
-        ch.ground_velocity = new_ground_vel;
-        ch.crouched = crouched;
-        ch.collision_flags = flags_out;
-        ch.landing_speed = landing_speed;
-        ch.air_ticks = air_ticks;
-        ch.jump_latched = jump_latched;
     }
 
     /// Does a capsule at `pos` stay clear of every obstacle?

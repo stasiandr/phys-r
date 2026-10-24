@@ -80,6 +80,9 @@ namespace PhysR
         public uint PositionIterations;
         public uint HistoryTicks;
         public uint EnableSleep;
+        /// <summary>Worker threads (0 = auto, 1 = single-threaded). Results are identical.</summary>
+        public uint Threads;
+        uint _pad;
 
         public static WorldSettings Default
         {
@@ -149,6 +152,23 @@ namespace PhysR
             Mask = mask;
             Exclude = exclude;
             Flags = flags;
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RayQuery
+    {
+        public FPVector3 Origin;
+        public FPVector3 Direction;
+        public FP MaxDistance;
+        public QueryFilter Filter;
+
+        public RayQuery(FPVector3 origin, FPVector3 direction, FP maxDistance, QueryFilter filter)
+        {
+            Origin = origin;
+            Direction = direction;
+            MaxDistance = maxDistance;
+            Filter = filter;
         }
     }
 
@@ -342,6 +362,7 @@ namespace PhysR
         [DllImport(Lib, CallingConvention = CC)] public static extern void pr_world_destroy(IntPtr w);
         [DllImport(Lib, CallingConvention = CC)] public static extern void pr_world_step(IntPtr w, uint steps);
         [DllImport(Lib, CallingConvention = CC)] public static extern uint pr_world_tick(IntPtr w);
+        [DllImport(Lib, CallingConvention = CC)] public static extern void pr_world_set_threads(IntPtr w, uint threads);
         [DllImport(Lib, CallingConvention = CC)] public static extern void pr_world_set_gravity(IntPtr w, ref FPVector3 g);
 
         [DllImport(Lib, CallingConvention = CC)] public static extern uint pr_shape_sphere(IntPtr w, long radius);
@@ -369,6 +390,7 @@ namespace PhysR
         [DllImport(Lib, CallingConvention = CC)] public static extern uint pr_body_set_flags(IntPtr w, ulong h, uint flags);
 
         [DllImport(Lib, CallingConvention = CC)] public static extern uint pr_raycast(IntPtr w, ref FPVector3 origin, ref FPVector3 dir, long maxDist, ref QueryFilter filter, out RayHit hit);
+        [DllImport(Lib, CallingConvention = CC)] public static extern uint pr_raycast_batch(IntPtr w, [In] RayQuery[] rays, uint n, [Out] RayHit[] hits);
         [DllImport(Lib, CallingConvention = CC)] public static extern uint pr_raycast_rewind(IntPtr w, uint tick, long alpha, ref FPVector3 origin, ref FPVector3 dir, long maxDist, ref QueryFilter filter, out RayHit hit);
         [DllImport(Lib, CallingConvention = CC)] public static extern uint pr_overlap_sphere(IntPtr w, ref FPVector3 center, long radius, ref QueryFilter filter, [Out] ulong[] output, uint capacity);
         [DllImport(Lib, CallingConvention = CC)] public static extern uint pr_sphere_cast(IntPtr w, ref FPVector3 center, long radius, ref FPVector3 disp, ref QueryFilter filter, out SweepHit hit);

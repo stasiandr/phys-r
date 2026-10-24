@@ -31,10 +31,14 @@ pub mod fixed;
 pub mod geometry;
 pub mod history;
 pub mod math;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod pool;
 pub mod query;
 pub mod shape;
+mod simd;
 pub mod snapshot;
 pub mod solver;
+pub(crate) mod upright;
 pub mod world;
 
 pub use body::{flags, Body, BodyDesc, BodyHandle, BodyKind};
@@ -43,7 +47,7 @@ pub use door::{Door, DoorDesc, DoorHandle, DoorKind};
 pub use fixed::Fx;
 pub use geometry::Aabb;
 pub use math::{Iso, Mat3, Quat, Vec3};
-pub use query::{QueryFilter, RayHit, SweepHit};
+pub use query::{QueryFilter, RayHit, RayQuery, SweepHit};
 pub use shape::{Shape, ShapeId};
 pub use snapshot::SnapshotError;
 pub use solver::Manifold;

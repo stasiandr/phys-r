@@ -84,6 +84,8 @@ typedef struct {
     uint32_t position_iterations;
     uint32_t history_ticks;
     uint32_t enable_sleep;
+    uint32_t threads; /* 0 = auto, 1 = single-threaded; results identical */
+    uint32_t _pad;
 } PrWorldSettings;
 
 typedef struct {
@@ -127,6 +129,13 @@ typedef struct {
     uint32_t flags;
     uint64_t exclude;
 } PrQueryFilter;
+
+typedef struct {
+    PrVec3 origin;
+    PrVec3 dir;
+    pr_fx max_dist;
+    PrQueryFilter filter;
+} PrRayQuery;
 
 typedef struct {
     uint64_t body;
@@ -247,6 +256,7 @@ PrWorld *pr_world_create(const PrWorldSettings *settings /* nullable */);
 void pr_world_destroy(PrWorld *w);
 void pr_world_step(PrWorld *w, uint32_t steps);
 uint32_t pr_world_tick(PrWorld *w);
+void pr_world_set_threads(PrWorld *w, uint32_t threads);
 void pr_world_set_gravity(PrWorld *w, const PrVec3 *g);
 
 /* Shapes: convex primitives only (registered in order; not part of snapshots).
@@ -276,6 +286,8 @@ uint32_t pr_body_set_flags(PrWorld *w, uint64_t body, uint32_t flags);
 
 /* Queries (filter may be null = hit everything) */
 uint32_t pr_raycast(PrWorld *w, const PrVec3 *origin, const PrVec3 *dir, pr_fx max_dist, const PrQueryFilter *filter, PrRayHit *out);
+/* Casts n rays in parallel; out[i].body == 0 on a miss. Returns the hit count. */
+uint32_t pr_raycast_batch(PrWorld *w, const PrRayQuery *rays, uint32_t n, PrRayHit *out);
 uint32_t pr_raycast_rewind(PrWorld *w, uint32_t tick, pr_fx alpha, const PrVec3 *origin, const PrVec3 *dir, pr_fx max_dist, const PrQueryFilter *filter, PrRayHit *out);
 uint32_t pr_overlap_sphere(PrWorld *w, const PrVec3 *center, pr_fx radius, const PrQueryFilter *filter, uint64_t *out, uint32_t capacity);
 uint32_t pr_sphere_cast(PrWorld *w, const PrVec3 *center, pr_fx radius, const PrVec3 *disp, const PrQueryFilter *filter, PrSweepHit *out);

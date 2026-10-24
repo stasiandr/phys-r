@@ -4,7 +4,7 @@ Fast, **deterministic** 3D physics in Rust for **networked first-person shooters
 
 - **Bit-identical everywhere.** The whole simulation runs in Q40.24 fixed point (`Fx`, an `i64`). There are no floats in the simulation path, so x86_64, i686, ARM64 and ARMv7 produce exactly the same state, in debug and release builds. A golden-hash test verifies this on all four.
 - **Built for FPS.** It includes a deterministic character controller, hitscan raycasts with hit zones, lag compensation (rewound raycasts), snapshots/rollback and a state hash for desync detection.
-- **Fast.** No dependencies, no allocations in the steady-state step, sleeping islands, and a SAH BVH for level geometry. Mover queries use a refit BVH. The solver uses precomputed Jacobians.
+- **Fast.** No dependencies, no allocations in the steady-state step, and sleeping islands. Level geometry sits in a SAH BVH that is traversed as a 4-wide tree with SIMD (SSE / NEON) box tests. Characters and batched raycasts run on a small worker pool. Upright capsules against level boxes use closed-form sweeps. The solver uses precomputed Jacobians.
 
 ## Features
 
@@ -15,7 +15,7 @@ Fast, **deterministic** 3D physics in Rust for **networked first-person shooters
 | Solver | Sequential impulse with warm starting, central friction plus twist friction, split-impulse position correction (stacks stay quiet), speculative contacts, optional velocity-expanded CCD |
 | Sleeping | Island-based, deterministic union-find |
 | Events | Contact begin/end, sensor (trigger) enter/exit |
-| Queries | Raycast (closest hit, with body-local hit point for headshots), sphere cast, capsule cast, sphere/shape overlap, layer masks, exclusion |
+| Queries | Raycast (closest hit, with body-local hit point for headshots), parallel `raycast_batch` for all shots of a tick, sphere cast, capsule cast, sphere/shape overlap, layer masks, exclusion |
 | Character | See below |
 | Doors | Hinged or sliding, open/close/partial targets at a fixed speed, exact kinematic poses, stop on players or push them; state is in snapshots |
 | Netcode | `save_snapshot` / `load_snapshot`, `state_hash`, single-character `simulate_character` for prediction/replay, pose history plus `raycast_rewind` for lag compensation |
@@ -101,15 +101,23 @@ Determinism rules on the C# side:
 
 ### Target map: 5000 static colliders, 20 doors, 16 players
 
-Run `cargo run --release -p phys-r --example fps_map`. The scene has 400 floor tiles plus 4600 walls, crates, pillars, capsules and ramps (a third of them rotated), 20 hinged doors opening and closing, 16 players running, jumping and crouching, and 32 hitscan rays per tick.
+Run `cargo run --release -p phys-r --example fps_map` (`THREADS=1` forces single-threaded). The scene has 400 floor tiles plus 4600 walls, crates, pillars, capsules and ramps (a third of them rotated), 20 hinged doors opening and closing, 16 players running, jumping and crouching, and 32 hitscan rays per tick cast with `raycast_batch`.
 
-| | x86_64 container |
-|---|---:|
-| Level build (BVH, once at load) | ~11 ms |
-| Step (doors + 16 players) | ~40–48 µs avg |
-| Raycast across the map | ~0.9–1 µs |
+Results on a shared 4-vCPU x86_64 cloud VM (noisy; best of several runs):
 
-Thousands of static colliders cost almost nothing per tick. They sit in an SAH BVH, and every per-tick loop only visits moving bodies. Characters and doors query static geometry only through their own sweeps.
+| | before | 1 thread | 4 threads |
+|---|---:|---:|---:|
+| Step (doors + 16 players) | ~40 µs | ~28 µs | ~21 µs |
+| Raycast across the map | ~0.9 µs | ~0.6 µs | ~0.33 µs |
+| Whole tick (step + 32 shots) | ~69 µs | ~47 µs | ~32 µs |
+
+Thousands of static colliders cost almost nothing per tick. They sit in an SAH BVH, and every per-tick loop only visits moving bodies. Each character gathers nearby statics once per tick from a compact, spatially ordered copy of the level, then runs about four sweeps against a dozen obstacles.
+
+### Threads and determinism
+
+`WorldSettings::threads` (`0` = auto, up to 4; also `World::set_threads`, `pr_world_set_threads`) sets the worker count. Character moves are computed in parallel from the same start-of-tick state and applied in index order. Batched rays only read the world. The result is bit-identical for every thread count, which the golden test checks. Items keep their thread across ticks (character `i` and shot `i` prefer the same core), so each core stays warm on its part of the level.
+
+The SIMD box tests are f32, and they only cull conservatively: boxes are inflated outward, and every surviving candidate is decided by the exact fixed-point test. Rounding differences between SSE, NEON and scalar code therefore never change a result.
 
 ### Prop-heavy worst case
 
@@ -146,4 +154,4 @@ If you intentionally change simulation behavior, update `GOLDEN` in `crates/phys
 
 - No joints or constraints besides contacts yet.
 - No convex hulls or meshes. Model the level with boxes, capsules and spheres.
-- Single-threaded per world. Run several worlds on different threads if needed.
+- Only characters and batched raycasts run in parallel; the rigid-body solver is single-threaded (it is cheap when props sleep).

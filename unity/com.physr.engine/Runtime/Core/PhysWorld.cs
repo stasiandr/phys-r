@@ -122,6 +122,17 @@ namespace PhysR
         }
 
         /// <summary>
+        /// Casts the first <paramref name="count"/> rays in parallel on the
+        /// world's worker threads (e.g. every shot of a tick). hits[i] is the
+        /// result of rays[i]; a miss has an invalid Body. Returns the hit count.
+        /// </summary>
+        public int RaycastBatch(RayQuery[] rays, RayHit[] hits, int count)
+        {
+            if (count > rays.Length || count > hits.Length) throw new ArgumentException("count exceeds array length");
+            return (int)PhysRNative.pr_raycast_batch(Ptr, rays, (uint)count, hits);
+        }
+
+        /// <summary>
         /// Lag-compensated raycast: bodies flagged History are tested at their
         /// poses from <paramref name="tick"/> + <paramref name="alpha"/>.
         /// </summary>

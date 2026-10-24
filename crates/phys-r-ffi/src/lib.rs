@@ -12,7 +12,7 @@
 use phys_r::body::{BodyDesc, BodyHandle, BodyKind};
 use phys_r::character::{CharacterDesc, CharacterHandle, CharacterInput, MoveMode, MovementSettings};
 use phys_r::door::{DoorDesc, DoorHandle, DoorKind};
-use phys_r::query::QueryFilter;
+use phys_r::query::{QueryFilter, RayHit, RayQuery};
 use phys_r::{Fx, Quat, Shape, ShapeId, Vec3, World, WorldSettings};
 
 pub const PR_VERSION: u32 = 1;
@@ -86,6 +86,9 @@ pub struct PrWorldSettings {
     pub position_iterations: u32,
     pub history_ticks: u32,
     pub enable_sleep: u32,
+    /// Worker threads (0 = auto, 1 = single-threaded); results identical.
+    pub threads: u32,
+    pub _pad: u32,
 }
 
 impl From<&WorldSettings> for PrWorldSettings {
@@ -105,6 +108,8 @@ impl From<&WorldSettings> for PrWorldSettings {
             position_iterations: s.position_iterations,
             history_ticks: s.history_ticks,
             enable_sleep: s.enable_sleep as u32,
+            threads: s.threads,
+            _pad: 0,
         }
     }
 }
@@ -126,6 +131,7 @@ impl From<&PrWorldSettings> for WorldSettings {
             time_to_sleep: Fx(s.time_to_sleep),
             enable_sleep: s.enable_sleep != 0,
             history_ticks: s.history_ticks.min(4096),
+            threads: s.threads.min(64),
         }
     }
 }
@@ -223,6 +229,16 @@ impl From<&PrQueryFilter> for QueryFilter {
             include_moving: f.flags & 4 == 0,
         }
     }
+}
+
+/// One ray of `pr_raycast_batch`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct PrRayQuery {
+    pub origin: PrVec3,
+    pub dir: PrVec3,
+    pub max_dist: i64,
+    pub filter: PrQueryFilter,
 }
 
 #[repr(C)]
@@ -489,6 +505,14 @@ pub unsafe extern "C" fn pr_world_step(w: *mut World, steps: u32) {
     }
 }
 
+/// Change the worker thread count (0 = auto). Results do not depend on it.
+#[no_mangle]
+pub unsafe extern "C" fn pr_world_set_threads(w: *mut World, threads: u32) {
+    if let Some(w) = world(w) {
+        w.set_threads(threads.min(64));
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pr_world_tick(w: *mut World) -> u32 {
     world(w).map_or(0, |w| w.tick())
@@ -743,6 +767,52 @@ pub unsafe extern "C" fn pr_raycast(
         }
         None => 0,
     }
+}
+
+std::thread_local! {
+    static BATCH: core::cell::RefCell<(Vec<RayQuery>, Vec<Option<RayHit>>)> = const { core::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Cast `n` rays in parallel on the world's worker threads. `out[i]` gets
+/// the hit of `rays[i]` (`body == 0` on a miss). Returns the number of hits.
+#[no_mangle]
+pub unsafe extern "C" fn pr_raycast_batch(w: *mut World, rays: *const PrRayQuery, n: u32, out: *mut PrRayHit) -> u32 {
+    let Some(w) = world(w) else { return 0 };
+    if n == 0 || rays.is_null() || out.is_null() {
+        return 0;
+    }
+    let rays = core::slice::from_raw_parts(rays, n as usize);
+    let out = core::slice::from_raw_parts_mut(out, n as usize);
+    BATCH.with(|b| {
+        let (q, hits) = &mut *b.borrow_mut();
+        q.clear();
+        q.extend(rays.iter().map(|r| RayQuery {
+            origin: r.origin.into(),
+            dir: r.dir.into(),
+            max_dist: Fx(r.max_dist),
+            filter: QueryFilter::from(&r.filter),
+        }));
+        hits.clear();
+        hits.resize(q.len(), None);
+        w.raycast_batch(q, hits);
+        let mut count = 0;
+        for (o, h) in out.iter_mut().zip(hits.iter()) {
+            *o = match h {
+                Some(h) => {
+                    count += 1;
+                    PrRayHit {
+                        body: h.body.to_bits(),
+                        distance: h.distance.0,
+                        point: h.point.into(),
+                        normal: h.normal.into(),
+                        local_point: h.local_point.into(),
+                    }
+                }
+                None => PrRayHit::default(),
+            };
+        }
+        count
+    })
 }
 
 /// Lag-compensated raycast against poses recorded at `tick + alpha`.
@@ -1231,12 +1301,13 @@ mod tests {
         // Mirrored in C and C#: changing these breaks the ABI.
         assert_eq!(core::mem::size_of::<PrVec3>(), 24);
         assert_eq!(core::mem::size_of::<PrQuat>(), 32);
-        assert_eq!(core::mem::size_of::<PrWorldSettings>(), 24 + 9 * 8 + 4 * 4);
+        assert_eq!(core::mem::size_of::<PrWorldSettings>(), 24 + 9 * 8 + 6 * 4);
         assert_eq!(core::mem::size_of::<PrBodyDesc>(), 8 + 24 + 32 + 24 + 24 + 6 * 8 + 16 + 8);
         assert_eq!(core::mem::size_of::<PrBodyState>(), 24 + 32 + 24 + 24 + 8 + 8);
         assert_eq!(core::mem::size_of::<PrTransformF>(), 32);
         assert_eq!(core::mem::size_of::<PrQueryFilter>(), 16);
         assert_eq!(core::mem::size_of::<PrRayHit>(), 8 + 8 + 24 * 3);
+        assert_eq!(core::mem::size_of::<PrRayQuery>(), 24 * 2 + 8 + 16);
         assert_eq!(core::mem::size_of::<PrSweepHit>(), 8 + 8 + 24);
         assert_eq!(core::mem::size_of::<PrMovementSettings>(), 11 * 8 + 8);
         assert_eq!(core::mem::size_of::<PrCharacterDesc>(), 24 + 9 * 8 + 16 + 8 + 96);

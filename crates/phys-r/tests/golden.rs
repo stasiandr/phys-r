@@ -12,7 +12,7 @@
 
 use phys_r::*;
 
-const GOLDEN: u64 = 0xa5e5_555d_d8fc_c9a4;
+const GOLDEN: u64 = 0x2f2ccfbe10e605cc;
 
 fn f(v: f64) -> Fx {
     Fx::from_f64(v)
@@ -22,8 +22,8 @@ fn v(x: f64, y: f64, z: f64) -> Vec3 {
     Vec3::new(f(x), f(y), f(z))
 }
 
-fn scenario() -> (u64, Vec<u64>) {
-    let mut w = World::new(WorldSettings::default());
+fn scenario(threads: u32) -> (u64, Vec<u64>) {
+    let mut w = World::new(WorldSettings { threads, ..Default::default() });
     // Level floor: tiles of slightly different heights (small ledges).
     let tile = w.add_shape(Shape::cuboid(v(2.0, 1.0, 2.0)));
     for i in 0..12 {
@@ -131,6 +131,25 @@ fn scenario() -> (u64, Vec<u64>) {
                     acc = acc.rotate_left(5) ^ (h.distance.0 as u64);
                 }
             }
+            // Batched rays (parallel when threads > 1) must match single casts.
+            let rays: Vec<RayQuery> = (0..24)
+                .map(|r| {
+                    let (s, c) = Fx::from_ratio(r * 26, 100).sin_cos();
+                    RayQuery {
+                        origin: v(-3.0, 0.8, 1.0),
+                        dir: Vec3::new(s, f(-0.05), c),
+                        max_dist: f(40.0),
+                        filter: QueryFilter::default(),
+                    }
+                })
+                .collect();
+            let mut hits = vec![None; rays.len()];
+            w.raycast_batch(&rays, &mut hits);
+            for (r, h) in rays.iter().zip(&hits) {
+                let single = w.raycast(r.origin, r.dir, r.max_dist, &r.filter);
+                assert_eq!(h.map(|h| (h.body, h.distance, h.point)), single.map(|h| (h.body, h.distance, h.point)));
+                acc = acc.rotate_left(3) ^ h.map_or(1, |h| h.distance.0 as u64 ^ h.body.to_bits());
+            }
             trace.push(acc);
         }
     }
@@ -161,7 +180,9 @@ fn scenario() -> (u64, Vec<u64>) {
 
 #[test]
 fn golden_state_hash() {
-    let (h, trace) = scenario();
+    let (h, trace) = scenario(1);
+    // Parallel phases must not change a single bit.
+    assert_eq!(scenario(4), (h, trace.clone()), "result depends on thread count");
     let folded = trace.iter().fold(h, |a, x| a.rotate_left(13) ^ x);
     println!("GOLDEN = 0x{folded:016x}");
     for (i, t) in trace.iter().enumerate() {

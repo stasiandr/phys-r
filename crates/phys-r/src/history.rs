@@ -68,11 +68,16 @@ impl World {
         frame.tick = tick;
         frame.valid = true;
         frame.entries.clear();
-        for (i, b) in self.bodies.iter().enumerate() {
-            if b.alive && b.flags & flags::HISTORY != 0 {
-                frame.entries.push(Entry { index: i as u32, generation: b.generation, pos: b.position, rot: b.rotation });
+        // Only moving bodies change pose; static ones are tested at their
+        // (unchanging) current pose by `raycast_rewind`.
+        for &i in &self.movers {
+            let b = &self.bodies[i as usize];
+            if b.flags & flags::HISTORY != 0 {
+                frame.entries.push(Entry { index: i, generation: b.generation, pos: b.position, rot: b.rotation });
             }
         }
+        // `movers` is in sweep order; rewind lookups binary-search by index.
+        frame.entries.sort_unstable_by_key(|e| e.index);
     }
 
     /// Pose of a recorded body at `tick + alpha` (alpha in [0, 1)).

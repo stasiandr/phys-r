@@ -6,6 +6,7 @@
 
 use crate::fixed::Fx;
 use crate::geometry::{Aabb, Ray};
+use crate::simd::{Box4, F4};
 
 const LEAF_SIZE: usize = 4;
 const BINS: usize = 12;
@@ -26,6 +27,78 @@ pub struct Bvh {
     nodes: Vec<Node>,
     items: Vec<u32>,
     item_aabbs: Vec<Aabb>,
+    /// 4-wide f32 copy of the tree used for traversal (see [`WNode`]).
+    wide: Vec<WNode>,
+    /// Leaves of the wide tree: up to four conservative item boxes each.
+    leaves: Vec<Leaf>,
+}
+
+/// A 4-wide node with f32 bounds in SoA layout: one node test is a handful
+/// of packed SSE / NEON instructions (see [`crate::simd`]).
+///
+/// The f32 boxes are inflated outward, so they only ever *cull*
+/// conservatively: every item the exact fixed-point test could accept
+/// survives, and the exact test then decides. Results are therefore
+/// bit-identical to a pure fixed-point traversal on every platform.
+#[derive(Clone, Copy, Debug)]
+struct WNode {
+    b: Box4,
+    /// Inner lane: wide node index. Leaf lane: leaf index. Empty: unused.
+    child: [u32; 4],
+    /// Bit `l` set when lane `l` is a leaf.
+    leaf_mask: u32,
+    /// Bit `l` set when lane `l` is used.
+    used_mask: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Leaf {
+    b: Box4,
+    start: u32,
+    count: u32,
+}
+
+#[inline]
+fn f_lo(v: Fx) -> f32 {
+    let x = v.to_f64();
+    (x - (1e-3 + x.abs() * 1e-6)) as f32
+}
+
+#[inline]
+fn f_hi(v: Fx) -> f32 {
+    let x = v.to_f64();
+    (x + (1e-3 + x.abs() * 1e-6)) as f32
+}
+
+#[inline]
+fn f_box(a: &Aabb) -> [f32; 6] {
+    [f_lo(a.min.x), f_lo(a.min.y), f_lo(a.min.z), f_hi(a.max.x), f_hi(a.max.y), f_hi(a.max.z)]
+}
+
+/// Ray in f32 for culling.
+struct FRay {
+    o: [F4; 3],
+    inv: [F4; 3],
+}
+
+impl FRay {
+    #[inline]
+    fn new(r: &Ray) -> FRay {
+        let f = |i: usize| {
+            let d = r.dir.get(i).to_f64();
+            let inv = if d.abs() < 1e-12 { 1e30f32.copysign(if d < 0.0 { -1.0 } else { 1.0 }) } else { (1.0 / d) as f32 };
+            (F4::splat(r.origin.get(i).to_f64() as f32), F4::splat(inv))
+        };
+        let (a, b, c) = (f(0), f(1), f(2));
+        FRay { o: [a.0, b.0, c.0], inv: [a.1, b.1, c.1] }
+    }
+}
+
+/// Conservative f32 bound for an exact distance.
+#[inline]
+fn t_bound(t: Fx) -> f32 {
+    let x = t.to_f64();
+    (x + 1e-3 + x.abs() * 1e-5) as f32
 }
 
 impl Bvh {
@@ -41,13 +114,67 @@ impl Bvh {
             nodes: Vec::with_capacity(aabbs.len() / 2 + 1),
             items: Vec::with_capacity(aabbs.len()),
             item_aabbs: Vec::with_capacity(aabbs.len()),
+            wide: Vec::new(),
+            leaves: Vec::new(),
         };
         if aabbs.is_empty() {
             return bvh;
         }
         let mut work: Vec<(u32, Aabb)> = ids.into_iter().zip(aabbs.iter().copied()).collect();
         bvh.build_rec(&mut work);
+        bvh.widen();
         bvh
+    }
+
+    /// (Re)build the 4-wide f32 tree from the binary tree.
+    fn widen(&mut self) {
+        self.wide.clear();
+        self.leaves.clear();
+        if !self.nodes.is_empty() {
+            self.wide_rec(0);
+        }
+    }
+
+    fn wide_rec(&mut self, bin: u32) -> u32 {
+        let idx = self.wide.len() as u32;
+        self.wide.push(WNode { b: Box4::EMPTY, child: [0; 4], leaf_mask: 0, used_mask: 0 });
+        // Collapse up to two binary levels into four lanes.
+        let mut lanes: [u32; 4] = [0; 4];
+        let mut n;
+        let root = &self.nodes[bin as usize];
+        if root.count > 0 {
+            lanes[0] = bin;
+            n = 1;
+        } else {
+            lanes[0] = bin + 1;
+            lanes[1] = root.offset;
+            n = 2;
+            while n < 4 {
+                let Some(k) = (0..n).find(|&k| self.nodes[lanes[k] as usize].count == 0) else { break };
+                let inner = lanes[k];
+                lanes[k] = inner + 1;
+                lanes[n] = self.nodes[inner as usize].offset;
+                n += 1;
+            }
+        }
+        let mut w = WNode { b: Box4::EMPTY, child: [0; 4], leaf_mask: 0, used_mask: (1 << n) - 1 };
+        for (l, &b) in lanes[..n].iter().enumerate() {
+            let node = self.nodes[b as usize].clone();
+            w.b.set(l, &f_box(&node.aabb));
+            if node.count > 0 {
+                let mut leaf = Leaf { b: Box4::EMPTY, start: node.offset, count: node.count };
+                for k in 0..node.count as usize {
+                    leaf.b.set(k, &f_box(&self.item_aabbs[node.offset as usize + k]));
+                }
+                w.child[l] = self.leaves.len() as u32;
+                w.leaf_mask |= 1 << l;
+                self.leaves.push(leaf);
+            } else {
+                w.child[l] = self.wide_rec(b);
+            }
+        }
+        self.wide[idx as usize] = w;
+        idx
     }
 
     fn build_rec(&mut self, work: &mut [(u32, Aabb)]) -> u32 {
@@ -111,6 +238,7 @@ impl Bvh {
             };
             self.nodes[i].aabb = b;
         }
+        self.widen();
     }
 
     pub fn len(&self) -> usize {
@@ -125,96 +253,123 @@ impl Bvh {
         self.nodes.first().map(|n| n.aabb).unwrap_or(Aabb::EMPTY)
     }
 
-    /// Calls `f(id)` for every item whose box overlaps `aabb`, in a
-    /// deterministic order.
+    /// Calls `f(id)` for every item whose exact box overlaps `aabb`. The
+    /// visiting order is deterministic but unspecified; callers sort.
     #[inline]
     pub fn query_aabb(&self, aabb: &Aabb, mut f: impl FnMut(u32)) {
-        if self.nodes.is_empty() {
+        self.query_aabb_slots(aabb, |k| f(self.items[k as usize]));
+    }
+
+    /// Item ids in slot order (slots are what the `*_slots` queries report;
+    /// spatially close items have close slots).
+    #[inline]
+    pub fn ids(&self) -> &[u32] {
+        &self.items
+    }
+
+    /// Like [`Bvh::query_aabb`] but reports item slots.
+    #[inline]
+    pub fn query_aabb_slots(&self, aabb: &Aabb, mut f: impl FnMut(u32)) {
+        if self.wide.is_empty() {
             return;
         }
+        let fb = f_box(aabb);
+        let q = [F4::splat(fb[0]), F4::splat(fb[1]), F4::splat(fb[2]), F4::splat(fb[3]), F4::splat(fb[4]), F4::splat(fb[5])];
         let mut stack = [0u32; STACK];
         let mut sp = 1;
         while sp > 0 {
             sp -= 1;
-            let idx = stack[sp];
-            let node = &self.nodes[idx as usize];
-            if !node.aabb.overlaps(aabb) {
-                continue;
-            }
-            if node.count > 0 {
-                let s = node.offset as usize;
-                let e = s + node.count as usize;
-                for (id, a) in self.items[s..e].iter().zip(&self.item_aabbs[s..e]) {
-                    if a.overlaps(aabb) {
-                        f(*id);
+            let node = &self.wide[stack[sp] as usize];
+            let mut m = node.b.overlap(&q) & node.used_mask;
+            while m != 0 {
+                let l = m.trailing_zeros() as usize;
+                m &= m - 1;
+                if node.leaf_mask & (1 << l) != 0 {
+                    let leaf = &self.leaves[node.child[l] as usize];
+                    let mut lm = leaf.b.overlap(&q) & ((1 << leaf.count) - 1);
+                    while lm != 0 {
+                        let k = leaf.start as usize + lm.trailing_zeros() as usize;
+                        lm &= lm - 1;
+                        if self.item_aabbs[k].overlaps(aabb) {
+                            f(k as u32);
+                        }
                     }
+                } else if sp < STACK {
+                    stack[sp] = node.child[l];
+                    sp += 1;
                 }
-            } else if sp + 2 <= STACK {
-                stack[sp] = node.offset;
-                stack[sp + 1] = idx + 1;
-                sp += 2;
             }
         }
     }
 
-    /// Ray traversal. `f(id, enter_t, max_t)` is called for items whose box
-    /// the ray enters before `max_t` (`enter_t` is that entry distance) and
-    /// returns `Some(t)` to shrink the ray. Children are visited near-first and
-    /// every box is tested exactly once.
+    /// Ray traversal. `f(id, max_t)` is called for candidate items (their
+    /// conservative box is hit before `max_t`) and returns `Some(t)` to shrink
+    /// the ray. Lanes are visited near-first.
     #[inline]
-    pub fn raycast(&self, ray: &Ray, mut max_t: Fx, mut f: impl FnMut(u32, Fx, Fx) -> Option<Fx>) -> Fx {
-        if self.nodes.is_empty() {
+    pub fn raycast(&self, ray: &Ray, max_t: Fx, mut f: impl FnMut(u32, Fx) -> Option<Fx>) -> Fx {
+        self.raycast_slots(ray, max_t, |k, t| f(self.items[k as usize], t))
+    }
+
+    /// Like [`Bvh::raycast`] but reports item slots.
+    #[inline]
+    pub fn raycast_slots(&self, ray: &Ray, mut max_t: Fx, mut f: impl FnMut(u32, Fx) -> Option<Fx>) -> Fx {
+        if self.wide.is_empty() {
             return max_t;
         }
-        let Some(t_root) = self.nodes[0].aabb.ray_test(ray, max_t) else { return max_t };
-        let mut stack = [(0u32, Fx::ZERO); STACK];
-        stack[0] = (0, t_root);
+        let r = FRay::new(ray);
+        let mut tmax = t_bound(max_t);
+        let mut stack = [(0u32, 0f32); STACK];
         let mut sp = 1;
         while sp > 0 {
             sp -= 1;
-            let (idx, t_enter) = stack[sp];
-            // The ray may have been shortened since this node was pushed.
-            if t_enter > max_t {
+            let (ni, tn_node) = stack[sp];
+            if tn_node > tmax {
                 continue;
             }
-            let node = &self.nodes[idx as usize];
-            if node.count > 0 {
-                let s = node.offset as usize;
-                let e = s + node.count as usize;
-                for (&id, a) in self.items[s..e].iter().zip(&self.item_aabbs[s..e]) {
-                    let Some(enter) = a.ray_test(ray, max_t) else { continue };
-                    if let Some(t) = f(id, enter, max_t) {
+            let node = &self.wide[ni as usize];
+            let (m, tn) = node.b.ray(&r.o, &r.inv, tmax);
+            let m = m & node.used_mask;
+            if m == 0 {
+                continue;
+            }
+            // Hit lanes sorted near-first (tiny insertion sort).
+            let mut order = [0usize; 4];
+            let mut k = 0;
+            let mut mm = m;
+            while mm != 0 {
+                let l = mm.trailing_zeros() as usize;
+                mm &= mm - 1;
+                let mut j = k;
+                while j > 0 && tn[order[j - 1]] > tn[l] {
+                    order[j] = order[j - 1];
+                    j -= 1;
+                }
+                order[j] = l;
+                k += 1;
+            }
+            // Leaves now (near-first); inner lanes pushed far-first.
+            for &l in &order[..k] {
+                if node.leaf_mask & (1 << l) == 0 || tn[l] > tmax {
+                    continue;
+                }
+                let leaf = &self.leaves[node.child[l] as usize];
+                let (lm, _) = leaf.b.ray(&r.o, &r.inv, tmax);
+                let mut lm = lm & ((1 << leaf.count) - 1);
+                while lm != 0 {
+                    let i = leaf.start as usize + lm.trailing_zeros() as usize;
+                    lm &= lm - 1;
+                    if let Some(t) = f(i as u32, max_t) {
                         if t < max_t {
                             max_t = t;
+                            tmax = t_bound(max_t);
                         }
                     }
                 }
-            } else if sp + 2 <= STACK {
-                let l = idx + 1;
-                let r = node.offset;
-                let tl = self.nodes[l as usize].aabb.ray_test(ray, max_t);
-                let tr = self.nodes[r as usize].aabb.ray_test(ray, max_t);
-                match (tl, tr) {
-                    (Some(a), Some(b)) => {
-                        // Push the farther child first so the nearer pops first.
-                        if a <= b {
-                            stack[sp] = (r, b);
-                            stack[sp + 1] = (l, a);
-                        } else {
-                            stack[sp] = (l, a);
-                            stack[sp + 1] = (r, b);
-                        }
-                        sp += 2;
-                    }
-                    (Some(a), None) => {
-                        stack[sp] = (l, a);
-                        sp += 1;
-                    }
-                    (None, Some(b)) => {
-                        stack[sp] = (r, b);
-                        sp += 1;
-                    }
-                    (None, None) => {}
+            }
+            for &l in order[..k].iter().rev() {
+                if node.leaf_mask & (1 << l) == 0 && sp < STACK {
+                    stack[sp] = (node.child[l], tn[l]);
+                    sp += 1;
                 }
             }
         }
@@ -310,5 +465,48 @@ mod tests {
         bvh.query_aabb(&Aabb::new(Vec3::from_int(9, -1, -1), Vec3::from_int(21, 1, 1)), |id| hits.push(id));
         hits.sort();
         assert_eq!(hits, vec![5, 6, 7, 8, 9, 10]);
+    }
+
+    /// The f32 culling must never lose an item the exact test accepts.
+    #[test]
+    fn wide_matches_brute_force() {
+        let mut seed = 0x1234_5678u64;
+        let mut rnd = |lo: i64, hi: i64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            Fx(lo + ((seed >> 20) as i64).rem_euclid(hi - lo))
+        };
+        let one = Fx::ONE.0;
+        let boxes: Vec<Aabb> = (0..3000)
+            .map(|_| {
+                let c = Vec3::new(rnd(-200 * one, 200 * one), rnd(-20 * one, 20 * one), rnd(-200 * one, 200 * one));
+                // Includes degenerate (flat) boxes touching exactly.
+                let h = Vec3::new(rnd(0, 4 * one), rnd(0, 4 * one), rnd(0, 4 * one));
+                Aabb::from_center_half(c, h)
+            })
+            .collect();
+        let bvh = Bvh::build(&boxes);
+        for _ in 0..2000 {
+            let o = Vec3::new(rnd(-250 * one, 250 * one), rnd(-30 * one, 30 * one), rnd(-250 * one, 250 * one));
+            let d = Vec3::new(rnd(-one, one), rnd(-one / 4, one / 4), rnd(-one, one));
+            let d = d.normalize_or(Vec3::X);
+            let ray = Ray::new(o, d);
+            let max_t = Fx::from_int(300);
+            let brute = boxes.iter().enumerate().filter_map(|(i, b)| b.ray_test(&ray, max_t).map(|t| (t, i as u32))).min();
+            let mut best: Option<(Fx, u32)> = None;
+            bvh.raycast(&ray, max_t, |id, cur| {
+                let t = boxes[id as usize].ray_test(&ray, cur)?;
+                if best.is_none_or(|b| (t, id) < b) {
+                    best = Some((t, id));
+                }
+                Some(t)
+            });
+            assert_eq!(best, brute);
+            let q = Aabb::from_center_half(o, Vec3::new(rnd(0, 10 * one), rnd(0, 10 * one), rnd(0, 10 * one)));
+            let mut a = Vec::new();
+            bvh.query_aabb(&q, |id| a.push(id));
+            a.sort();
+            let b: Vec<u32> = (0..boxes.len() as u32).filter(|&i| boxes[i as usize].overlaps(&q)).collect();
+            assert_eq!(a, b);
+        }
     }
 }

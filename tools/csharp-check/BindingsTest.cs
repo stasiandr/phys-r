@@ -63,6 +63,9 @@ static class Test {
             Check(world.AddVelocity(ch, new FPVector3(0, 8, 0)) && world.SetMode(ch, MoveMode.Walk), "knockback");
             RayHit hit;
             Check(world.Raycast(new FPVector3(0, 5, 0), FPVector3.Down, FP.FromInt(100), out hit) && hit.Body == ball, "raycast");
+            var batch = new RayQuery[] { new RayQuery(new FPVector3(0, 5, 0), FPVector3.Down, FP.FromInt(100), QueryFilter.All), new RayQuery(new FPVector3(0, 5, 0), FPVector3.Up, FP.FromInt(100), QueryFilter.All) };
+            var batchHits = new RayHit[2];
+            Check(world.RaycastBatch(batch, batchHits, 2) == 1 && batchHits[0].Body == ball && batchHits[0].Distance == hit.Distance && !batchHits[1].Body.IsValid, "raycast batch");
             var snap = world.SaveSnapshot();
             ulong h = world.StateHash();
             world.Step(30);

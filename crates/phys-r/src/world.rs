@@ -39,6 +39,10 @@ pub struct WorldSettings {
     pub enable_sleep: bool,
     /// Number of ticks kept for lag compensation.
     pub history_ticks: u32,
+    /// Worker threads for parallel phases (characters, batch raycasts).
+    /// 0 = automatic (up to 4), 1 = single-threaded. Results are identical
+    /// for any value.
+    pub threads: u32,
 }
 
 impl Default for WorldSettings {
@@ -58,6 +62,7 @@ impl Default for WorldSettings {
             time_to_sleep: fx!(0.5),
             enable_sleep: true,
             history_ticks: 64,
+            threads: 0,
         }
     }
 }
@@ -107,6 +112,9 @@ pub struct World {
 
     // Derived / scratch state.
     pub(crate) static_bvh: Bvh,
+    /// Collision data of static bodies in `static_bvh` slot order: a dense,
+    /// spatially coherent copy so queries do not touch the large `Body`.
+    pub(crate) static_cols: Vec<crate::query::ObRef>,
     /// Subset of `static_bvh` holding only static sensors.
     static_sensor_bvh: Bvh,
     pub(crate) static_dirty: bool,
@@ -114,8 +122,8 @@ pub struct World {
     movers_dirty: bool,
     /// BVH over moving bodies for queries; refit lazily on first use after a
     /// step and rebuilt periodically. Query results never depend on its shape.
-    mover_bvh: core::cell::RefCell<Bvh>,
-    mover_bvh_state: core::cell::Cell<u8>,
+    mover_bvh: Bvh,
+    mover_bvh_state: u8,
     pairs: Vec<(u32, u32)>,
     new_manifolds: Vec<Manifold>,
     scratch_pairs: Vec<(u32, u32)>,
@@ -128,6 +136,10 @@ pub struct World {
     pub(crate) events: Vec<Event>,
     pub(crate) history: History,
     pub(crate) scratch_obstacles: Vec<crate::query::ObRef>,
+    pub(crate) char_jobs: Vec<crate::character::CharJob>,
+    pub(crate) char_scratch_pool: Vec<Vec<crate::query::ObRef>>,
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) pool: Option<crate::pool::Pool>,
     pub(crate) snapshot_buf: Vec<u8>,
 }
 
@@ -141,7 +153,8 @@ const MOVER_BVH_MIN: usize = 24;
 impl World {
     pub fn new(settings: WorldSettings) -> World {
         let history = History::new(settings.history_ticks as usize);
-        World {
+        let threads = settings.threads;
+        let mut w = World {
             settings,
             shapes: Vec::new(),
             bodies: Vec::new(),
@@ -155,12 +168,13 @@ impl World {
             doors: Vec::new(),
             door_free: Vec::new(),
             static_bvh: Bvh::default(),
+            static_cols: Vec::new(),
             static_sensor_bvh: Bvh::default(),
             static_dirty: true,
             movers: Vec::new(),
             movers_dirty: true,
-            mover_bvh: core::cell::RefCell::new(Bvh::default()),
-            mover_bvh_state: core::cell::Cell::new(BVH_REBUILD),
+            mover_bvh: Bvh::default(),
+            mover_bvh_state: BVH_REBUILD,
             pairs: Vec::new(),
             new_manifolds: Vec::new(),
             scratch_pairs: Vec::new(),
@@ -173,7 +187,39 @@ impl World {
             events: Vec::new(),
             history,
             scratch_obstacles: Vec::new(),
+            char_jobs: Vec::new(),
+            char_scratch_pool: Vec::new(),
+            #[cfg(not(target_family = "wasm"))]
+            pool: None,
             snapshot_buf: Vec::new(),
+        };
+        w.set_threads(threads);
+        w
+    }
+
+    /// Change the number of worker threads (0 = automatic). Simulation
+    /// results do not depend on this setting.
+    pub fn set_threads(&mut self, threads: u32) {
+        self.settings.threads = threads;
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let n = match threads {
+                0 => std::thread::available_parallelism().map_or(1, |n| n.get()).min(4),
+                n => n as usize,
+            };
+            self.pool = if n > 1 { Some(crate::pool::Pool::new(n)) } else { None };
+        }
+    }
+
+    /// Worker threads in use (including the calling thread).
+    pub fn threads(&self) -> usize {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.pool.as_ref().map_or(1, |p| p.threads())
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            1
         }
     }
 
@@ -353,9 +399,10 @@ impl World {
         } else {
             b.sleeping = false;
             b.sleep_time = Fx::ZERO;
-            if self.mover_bvh_state.get() == BVH_FRESH {
-                self.mover_bvh_state.set(BVH_REFIT);
+            if self.mover_bvh_state == BVH_FRESH {
+                self.mover_bvh_state = BVH_REFIT;
             }
+            self.update_mover_tree();
         }
         true
     }
@@ -573,9 +620,10 @@ impl World {
         self.record_history();
         // Bodies moved: refresh query bounds, refit the query tree lazily.
         self.refresh_mover_bounds();
-        if self.mover_bvh_state.get() != BVH_REBUILD {
-            self.mover_bvh_state.set(if self.tick % 64 == 0 { BVH_REBUILD } else { BVH_REFIT });
+        if self.mover_bvh_state != BVH_REBUILD {
+            self.mover_bvh_state = if self.tick % 64 == 0 { BVH_REBUILD } else { BVH_REFIT };
         }
+        self.update_mover_tree();
     }
 
     #[inline(never)]
@@ -631,13 +679,18 @@ impl World {
             }
         }
         self.static_bvh = Bvh::build_with_ids(&aabbs, ids);
+        self.static_cols.clear();
+        for &i in self.static_bvh.ids() {
+            let b = &self.bodies[i as usize];
+            self.static_cols.push(crate::query::ObRef { body: i, shape: b.shape.0, iso: b.iso(), aabb: b.aabb });
+        }
         self.static_sensor_bvh = Bvh::build_with_ids(&sensor_aabbs, sensor_ids);
         self.static_dirty = false;
     }
 
     pub(crate) fn mark_movers_dirty(&mut self) {
         self.movers_dirty = true;
-        self.mover_bvh_state.set(BVH_REBUILD);
+        self.mover_bvh_state = BVH_REBUILD;
     }
 
     /// Visit moving bodies whose box overlaps `aabb` (any order).
@@ -650,39 +703,47 @@ impl World {
             }
             return;
         }
-        self.ensure_mover_bvh();
-        self.mover_bvh.borrow().query_aabb(aabb, f);
+        if self.mover_bvh_state != BVH_FRESH {
+            for &i in &self.movers {
+                if self.bodies[i as usize].aabb.overlaps(aabb) {
+                    f(i);
+                }
+            }
+            return;
+        }
+        self.mover_bvh.query_aabb(aabb, f);
     }
 
     /// Ray traversal over moving bodies; `f(id, max_t)` may shrink the ray.
-    pub(crate) fn raycast_movers(&self, ray: &crate::geometry::Ray, max_t: Fx, mut f: impl FnMut(u32, Fx, Fx) -> Option<Fx>) -> Fx {
-        if self.movers.len() < MOVER_BVH_MIN {
+    pub(crate) fn raycast_movers(&self, ray: &crate::geometry::Ray, max_t: Fx, mut f: impl FnMut(u32, Fx) -> Option<Fx>) -> Fx {
+        if self.movers.len() < MOVER_BVH_MIN || self.mover_bvh_state != BVH_FRESH {
             let mut t = max_t;
             for &i in &self.movers {
-                let Some(enter) = self.bodies[i as usize].aabb.ray_test(ray, t) else { continue };
-                if let Some(h) = f(i, enter, t) {
+                if let Some(h) = f(i, t) {
                     t = t.min(h);
                 }
             }
             return t;
         }
-        self.ensure_mover_bvh();
-        self.mover_bvh.borrow().raycast(ray, max_t, f)
+        self.mover_bvh.raycast(ray, max_t, f)
     }
 
-    fn ensure_mover_bvh(&self) {
-        match self.mover_bvh_state.get() {
+    /// Bring the mover query tree up to date (queries take `&self`, so the
+    /// world stays `Sync` and can be queried from many threads at once).
+    pub(crate) fn update_mover_tree(&mut self) {
+        self.rebuild_movers();
+        match self.mover_bvh_state {
             BVH_FRESH => {}
             BVH_REFIT => {
-                self.mover_bvh.borrow_mut().refit(|i| self.bodies[i as usize].aabb);
-                self.mover_bvh_state.set(BVH_FRESH);
+                let bodies = &self.bodies;
+                self.mover_bvh.refit(|i| bodies[i as usize].aabb);
             }
             _ => {
                 let aabbs: Vec<Aabb> = self.movers.iter().map(|&i| self.bodies[i as usize].aabb).collect();
-                *self.mover_bvh.borrow_mut() = Bvh::build_with_ids(&aabbs, self.movers.clone());
-                self.mover_bvh_state.set(BVH_FRESH);
+                self.mover_bvh = Bvh::build_with_ids(&aabbs, self.movers.clone());
             }
         }
+        self.mover_bvh_state = BVH_FRESH;
     }
 
     pub(crate) fn rebuild_movers(&mut self) {
@@ -694,7 +755,7 @@ impl World {
                 }
             }
             self.movers_dirty = false;
-            self.mover_bvh_state.set(BVH_REBUILD);
+            self.mover_bvh_state = BVH_REBUILD;
         }
     }
 
@@ -1134,4 +1195,12 @@ fn uf_union(p: &mut [u32], a: u32, b: u32) {
             p[ra as usize] = rb;
         }
     }
+}
+
+// Queries take `&self` and touch no interior mutability, so a world can be
+// shared across threads for read-only work (parallel characters/raycasts).
+#[allow(dead_code)]
+fn _assert_world_sync() {
+    fn is_sync<T: Sync>() {}
+    is_sync::<World>();
 }
