@@ -11,6 +11,7 @@
 
 use phys_r::body::{BodyDesc, BodyHandle, BodyKind};
 use phys_r::character::{CharacterDesc, CharacterHandle, CharacterInput, MoveMode, MovementSettings};
+use phys_r::door::{DoorDesc, DoorHandle, DoorKind};
 use phys_r::query::QueryFilter;
 use phys_r::{Fx, Quat, Shape, ShapeId, Vec3, World, WorldSettings};
 
@@ -708,14 +709,7 @@ pub unsafe extern "C" fn pr_body_set_material(w: *mut World, h: u64, friction: i
 
 #[no_mangle]
 pub unsafe extern "C" fn pr_body_set_flags(w: *mut World, h: u64, flags: u32) -> u32 {
-    let Some(w) = world(w) else { return 0 };
-    match w.body_mut(BodyHandle::from_bits(h)) {
-        Some(bd) => {
-            bd.flags = (bd.flags & phys_r::flags::CHARACTER) | (flags & !phys_r::flags::CHARACTER);
-            1
-        }
-        None => 0,
-    }
+    world(w).map_or(0, |w| b(w.set_body_flags(BodyHandle::from_bits(h), flags)))
 }
 
 // ---------------------------------------------------------------------------
@@ -940,6 +934,134 @@ pub unsafe extern "C" fn pr_character_of_body(w: *mut World, body: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Doors
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct PrDoorDesc {
+    pub shape: u32,
+    /// 0 hinge (amount in radians), 1 slide (amount in metres).
+    pub kind: u32,
+    /// Hinge: point on the axis. Slide: closed body centre.
+    pub pivot: PrVec3,
+    pub axis: PrVec3,
+    pub closed_rotation: PrQuat,
+    /// Hinge: closed body centre relative to pivot.
+    pub offset: PrVec3,
+    pub open_amount: i64,
+    pub speed: i64,
+    pub friction: i64,
+    pub layer: u32,
+    pub mask: u32,
+    /// Stop instead of pushing characters.
+    pub block_on_characters: u32,
+    pub _pad: u32,
+    pub user_data: u64,
+}
+
+impl From<&DoorDesc> for PrDoorDesc {
+    fn from(d: &DoorDesc) -> Self {
+        PrDoorDesc {
+            shape: d.shape.0,
+            kind: d.kind as u32,
+            pivot: d.pivot.into(),
+            axis: d.axis.into(),
+            closed_rotation: d.closed_rotation.into(),
+            offset: d.offset.into(),
+            open_amount: d.open_amount.0,
+            speed: d.speed.0,
+            friction: d.friction.0,
+            layer: d.layer as u32,
+            mask: d.mask,
+            block_on_characters: b(d.block_on_characters),
+            _pad: 0,
+            user_data: d.user_data,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct PrDoorState {
+    pub body: u64,
+    /// Current / target opening (radians or metres).
+    pub amount: i64,
+    pub target: i64,
+    /// 0 = closed .. 1 = open.
+    pub open_fraction: i64,
+    pub blocked: u32,
+    pub moving: u32,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pr_door_desc_default(out: *mut PrDoorDesc) {
+    write(out, PrDoorDesc::from(&DoorDesc::default()));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pr_door_create(w: *mut World, desc: *const PrDoorDesc) -> u64 {
+    let (Some(w), Some(d)) = (world(w), read(desc)) else { return 0 };
+    let dd = DoorDesc {
+        shape: ShapeId(d.shape),
+        kind: DoorKind::from_u8(d.kind.min(255) as u8),
+        pivot: d.pivot.into(),
+        axis: d.axis.into(),
+        closed_rotation: d.closed_rotation.into(),
+        offset: d.offset.into(),
+        open_amount: Fx(d.open_amount),
+        speed: Fx(d.speed),
+        friction: Fx(d.friction),
+        layer: (d.layer & 31) as u8,
+        mask: d.mask,
+        block_on_characters: d.block_on_characters != 0,
+        user_data: d.user_data,
+    };
+    w.create_door(&dd).map_or(0, |h| h.to_bits())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pr_door_destroy(w: *mut World, h: u64) -> u32 {
+    world(w).map_or(0, |w| b(w.destroy_door(DoorHandle::from_bits(h))))
+}
+
+/// Start opening (open != 0) or closing.
+#[no_mangle]
+pub unsafe extern "C" fn pr_door_set_open(w: *mut World, h: u64, open: u32) -> u32 {
+    world(w).map_or(0, |w| b(w.set_door_open(DoorHandle::from_bits(h), open != 0)))
+}
+
+/// Move toward a partial opening (0 = closed .. 1 = open).
+#[no_mangle]
+pub unsafe extern "C" fn pr_door_set_target(w: *mut World, h: u64, fraction: i64) -> u32 {
+    world(w).map_or(0, |w| b(w.set_door_target(DoorHandle::from_bits(h), Fx(fraction))))
+}
+
+/// Snap instantly to an opening (0..1).
+#[no_mangle]
+pub unsafe extern "C" fn pr_door_set_amount(w: *mut World, h: u64, fraction: i64) -> u32 {
+    world(w).map_or(0, |w| b(w.set_door_amount(DoorHandle::from_bits(h), Fx(fraction))))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pr_door_get_state(w: *mut World, h: u64, out: *mut PrDoorState) -> u32 {
+    let Some(w) = world(w) else { return 0 };
+    let Some(d) = w.door(DoorHandle::from_bits(h)) else { return 0 };
+    write(
+        out,
+        PrDoorState {
+            body: d.body().to_bits(),
+            amount: d.amount.0,
+            target: d.target.0,
+            open_fraction: d.open_fraction().0,
+            blocked: b(d.blocked),
+            moving: b(d.is_moving()),
+        },
+    );
+    1
+}
+
+// ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
 
@@ -1121,6 +1243,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<PrCharacterInput>(), 40);
         assert_eq!(core::mem::size_of::<PrCharacterState>(), 24 * 4 + 8 * 4 + 16);
         assert_eq!(core::mem::size_of::<PrEvent>(), 8 + 16 + 48);
+        assert_eq!(core::mem::size_of::<PrDoorDesc>(), 8 + 24 * 3 + 32 + 3 * 8 + 4 * 4 + 8);
+        assert_eq!(core::mem::size_of::<PrDoorState>(), 8 * 4 + 8);
     }
 
     #[test]

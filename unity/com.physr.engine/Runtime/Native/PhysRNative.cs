@@ -276,6 +276,55 @@ namespace PhysR
         public FPVector3 Normal;
     }
 
+    public enum DoorKind : uint
+    {
+        /// <summary>Rotates about an axis; amounts in radians.</summary>
+        Hinge = 0,
+        /// <summary>Translates along an axis; amounts in metres.</summary>
+        Slide = 1,
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DoorDesc
+    {
+        public ShapeId Shape;
+        public DoorKind Kind;
+        /// <summary>Hinge: point on the axis. Slide: closed body centre.</summary>
+        public FPVector3 Pivot;
+        /// <summary>Hinge axis / slide direction.</summary>
+        public FPVector3 Axis;
+        public FPQuaternion ClosedRotation;
+        /// <summary>Hinge: closed body centre relative to Pivot.</summary>
+        public FPVector3 Offset;
+        /// <summary>Fully open amount (radians or metres; sign = direction).</summary>
+        public FP OpenAmount;
+        public FP Speed;
+        public FP Friction;
+        public uint Layer;
+        public uint Mask;
+        /// <summary>1 = stop on players instead of pushing them.</summary>
+        public uint BlockOnCharacters;
+        uint _pad;
+        public ulong UserData;
+
+        public static DoorDesc Default
+        {
+            get { DoorDesc d; PhysRNative.pr_door_desc_default(out d); return d; }
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DoorState
+    {
+        public BodyHandle Body;
+        public FP Amount;
+        public FP Target;
+        /// <summary>0 = closed .. 1 = open.</summary>
+        public FP OpenFraction;
+        public uint Blocked;
+        public uint Moving;
+    }
+
     /// <summary>Raw P/Invoke declarations. Prefer the <see cref="PhysWorld"/> wrapper.</summary>
     public static class PhysRNative
     {
@@ -336,6 +385,14 @@ namespace PhysR
         [DllImport(Lib, CallingConvention = CC)] public static extern uint pr_character_add_velocity(IntPtr w, ulong h, ref FPVector3 dv);
         [DllImport(Lib, CallingConvention = CC)] public static extern uint pr_character_set_mode(IntPtr w, ulong h, uint mode);
         [DllImport(Lib, CallingConvention = CC)] public static extern ulong pr_character_of_body(IntPtr w, ulong body);
+
+        [DllImport(Lib, CallingConvention = CC)] public static extern void pr_door_desc_default(out DoorDesc d);
+        [DllImport(Lib, CallingConvention = CC)] public static extern ulong pr_door_create(IntPtr w, ref DoorDesc d);
+        [DllImport(Lib, CallingConvention = CC)] public static extern uint pr_door_destroy(IntPtr w, ulong h);
+        [DllImport(Lib, CallingConvention = CC)] public static extern uint pr_door_set_open(IntPtr w, ulong h, uint open);
+        [DllImport(Lib, CallingConvention = CC)] public static extern uint pr_door_set_target(IntPtr w, ulong h, long fraction);
+        [DllImport(Lib, CallingConvention = CC)] public static extern uint pr_door_set_amount(IntPtr w, ulong h, long fraction);
+        [DllImport(Lib, CallingConvention = CC)] public static extern uint pr_door_get_state(IntPtr w, ulong h, out DoorState s);
 
         [DllImport(Lib, CallingConvention = CC)] public static extern uint pr_world_event_count(IntPtr w);
         [DllImport(Lib, CallingConvention = CC)] public static extern uint pr_world_get_events(IntPtr w, [Out] PhysEvent[] output, uint capacity);

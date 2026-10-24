@@ -43,6 +43,8 @@ namespace PhysR
         readonly List<PhysRCharacter> characters = new List<PhysRCharacter>();
         readonly Dictionary<ulong, PhysRBody> byHandle = new Dictionary<ulong, PhysRBody>();
         readonly Dictionary<string, ShapeId> shapeCache = new Dictionary<string, ShapeId>();
+        readonly List<PhysRDoor> pendingDoors = new List<PhysRDoor>();
+        readonly List<PhysRDoor> doors = new List<PhysRDoor>();
 
         // Interpolation buffers (rendering only).
         ulong[] handles = new ulong[64];
@@ -153,6 +155,21 @@ namespace PhysR
             if (!pendingCharacters.Contains(c) && !characters.Contains(c)) pendingCharacters.Add(c);
         }
 
+        internal void Register(PhysRDoor d)
+        {
+            if (!pendingDoors.Contains(d) && !doors.Contains(d)) pendingDoors.Add(d);
+        }
+
+        internal void Unregister(PhysRDoor d)
+        {
+            pendingDoors.Remove(d);
+            if (doors.Remove(d))
+            {
+                if (world != null && d.Handle.IsValid) world.DestroyDoor(d.Handle);
+                visualsDirty = true;
+            }
+        }
+
         internal void Unregister(PhysRBody b)
         {
             pending.Remove(b);
@@ -183,7 +200,7 @@ namespace PhysR
         public void FlushPending()
         {
             if (flushing || world == null) return;
-            if (pending.Count == 0 && pendingCharacters.Count == 0) return;
+            if (pending.Count == 0 && pendingCharacters.Count == 0 && pendingDoors.Count == 0) return;
             flushing = true;
             pending.Sort(CompareBodies);
             pendingCharacters.Sort(CompareCharacters);
@@ -206,8 +223,19 @@ namespace PhysR
                     characters.Add(c);
                 }
             }
+            pendingDoors.Sort((a, b) =>
+            {
+                int c = a.creationOrder.CompareTo(b.creationOrder);
+                return c != 0 ? c : string.CompareOrdinal(a.HierarchyPath, b.HierarchyPath);
+            });
+            for (int i = 0; i < pendingDoors.Count; i++)
+            {
+                var d = pendingDoors[i];
+                if (d != null && d.CreateIn(this)) doors.Add(d);
+            }
             pending.Clear();
             pendingCharacters.Clear();
+            pendingDoors.Clear();
             visualsDirty = true;
             flushing = false;
         }
@@ -281,6 +309,12 @@ namespace PhysR
                 EnsureCapacity(n + 1);
                 handles[n++] = c.Body.Value;
                 visuals.Add(c.transform);
+            }
+            for (int i = 0; i < doors.Count; i++)
+            {
+                EnsureCapacity(n + 1);
+                handles[n++] = doors[i].Body.Value;
+                visuals.Add(doors[i].transform);
             }
             visualCount = n;
             world.GetTransforms(handles, curr, n);

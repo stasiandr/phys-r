@@ -43,6 +43,25 @@ namespace PhysR
         public override string ToString() { return "Character(" + (uint)Value + "v" + (uint)(Value >> 32) + ")"; }
     }
 
+    /// <summary>Generational door handle (0 = invalid).</summary>
+    [Serializable]
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DoorHandle : IEquatable<DoorHandle>
+    {
+        public ulong Value;
+
+        public DoorHandle(ulong v) { Value = v; }
+        public bool IsValid { get { return Value != 0; } }
+
+        public static readonly DoorHandle Invalid = new DoorHandle(0);
+        public static bool operator ==(DoorHandle a, DoorHandle b) { return a.Value == b.Value; }
+        public static bool operator !=(DoorHandle a, DoorHandle b) { return a.Value != b.Value; }
+        public bool Equals(DoorHandle o) { return Value == o.Value; }
+        public override bool Equals(object o) { return o is DoorHandle && ((DoorHandle)o).Value == Value; }
+        public override int GetHashCode() { return Value.GetHashCode(); }
+        public override string ToString() { return "Door(" + (uint)Value + "v" + (uint)(Value >> 32) + ")"; }
+    }
+
     /// <summary>Index into the world's shape registry.</summary>
     [Serializable]
     [StructLayout(LayoutKind.Sequential)]

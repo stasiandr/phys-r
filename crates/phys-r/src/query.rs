@@ -205,9 +205,8 @@ impl World {
         let ray = Ray::new(origin, dir);
         let mut best: Option<(Fx, u32, Vec3)> = None;
         let mut max_t = max_dist;
-        let test = |idx: u32, cur: Fx, best: &mut Option<(Fx, u32, Vec3)>| -> Option<Fx> {
+        let test = |idx: u32, enter: Fx, cur: Fx, best: &mut Option<(Fx, u32, Vec3)>| -> Option<Fx> {
             let b = &self.bodies[idx as usize];
-            let enter = b.aabb.ray_test(&ray, cur)?;
             // Re-base the ray near the shape to keep fixed-point magnitudes small.
             let base = (enter - fx!(0.5)).max(Fx::ZERO);
             let local = Ray { origin: ray.at(base), ..ray };
@@ -219,19 +218,19 @@ impl World {
             Some(t)
         };
         if filter.include_static {
-            max_t = self.static_bvh.raycast(&ray, max_t, |idx, cur| {
+            max_t = self.static_bvh.raycast(&ray, max_t, |idx, enter, cur| {
                 if !self.filter_accepts(idx, filter) {
                     return None;
                 }
-                test(idx, cur, &mut best)
+                test(idx, enter, cur, &mut best)
             });
         }
         if filter.include_moving {
-            self.raycast_movers(&ray, max_t, |idx, cur| {
+            self.raycast_movers(&ray, max_t, |idx, enter, cur| {
                 if !self.filter_accepts(idx, filter) {
                     return None;
                 }
-                test(idx, cur, &mut best)
+                test(idx, enter, cur, &mut best)
             });
         }
         best.map(|(t, idx, n)| self.make_hit(idx, &self.bodies[idx as usize].iso(), &ray, t, n))

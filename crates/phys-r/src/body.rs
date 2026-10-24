@@ -157,6 +157,9 @@ pub struct Body {
     pub(crate) sleeping: bool,
     pub(crate) sleep_time: Fx,
     pub user_data: u64,
+    /// Kinematic target pose reached exactly at the end of the next step.
+    pub(crate) has_target: bool,
+    pub(crate) target: Iso,
     // Derived data (recomputed every step, not part of snapshots).
     pub(crate) aabb: Aabb,
 }

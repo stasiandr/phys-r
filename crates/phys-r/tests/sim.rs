@@ -685,3 +685,128 @@ fn hitscan_hit_zones() {
     assert_eq!(legs.body, body);
     assert!(legs.local_point.y.to_f64() < -0.4);
 }
+
+// ---------------------------------------------------------------------------
+// Doors
+// ---------------------------------------------------------------------------
+
+/// Doorway in a wall along X at z = 5: two wall boxes leaving a 1.2 m gap
+/// at x in [-0.6, 0.6]; the door hinges at x = -0.6.
+fn doorway(w: &mut World, block: bool) -> DoorHandle {
+    let wall = w.add_shape(Shape::cuboid(v(4.0, 1.5, 0.1)));
+    w.create_body(&BodyDesc::new_static(wall, v(-4.6, 1.5, 5.0))).unwrap();
+    w.create_body(&BodyDesc::new_static(wall, v(4.6, 1.5, 5.0))).unwrap();
+    let slab = w.add_shape(Shape::cuboid(v(0.6, 1.1, 0.05)));
+    w.create_door(&DoorDesc {
+        shape: slab,
+        kind: DoorKind::Hinge,
+        pivot: v(-0.6, 1.1, 5.0),
+        axis: Vec3::Y,
+        offset: v(0.6, 0.0, 0.0),
+        // Swings toward +z (away from a player approaching from z < 5).
+        open_amount: -Fx::HALF_PI,
+        speed: f(2.0),
+        block_on_characters: block,
+        ..Default::default()
+    })
+    .unwrap()
+}
+
+#[test]
+fn hinge_door_opens_exactly_and_lets_players_through() {
+    let mut w = fps_world();
+    let door = doorway(&mut w, true);
+    let c = w.create_character(&CharacterDesc { position: v(0.0, 0.95, 2.0), ..Default::default() }).unwrap();
+    // Closed: blocked.
+    walk(&mut w, c, CharacterInput { move_z: Fx::ONE, ..Default::default() }, 90);
+    assert!(w.character(c).unwrap().position.z.to_f64() < 4.6);
+    // Back off, open, wait.
+    walk(&mut w, c, CharacterInput { move_z: Fx::NEG_ONE, ..Default::default() }, 30);
+    w.set_door_open(door, true);
+    let mut ticks = 0;
+    while w.door(door).unwrap().is_moving() {
+        walk(&mut w, c, CharacterInput::default(), 1);
+        ticks += 1;
+        assert!(ticks < 100);
+    }
+    // pi/2 at 2 rad/s = 0.785 s = 48 ticks.
+    assert!((47..=48).contains(&ticks), "{ticks}");
+    let d = w.door(door).unwrap();
+    let body = w.body(d.body()).unwrap();
+    let expect = d.pose_at(d.desc.open_amount);
+    assert_eq!((body.position, body.rotation), (expect.pos, expect.rot), "kinematic target must be exact");
+    assert!(body.linear_velocity.is_zero());
+    // Open: walk through.
+    walk(&mut w, c, CharacterInput { move_z: Fx::ONE, ..Default::default() }, 90);
+    assert!(w.character(c).unwrap().position.z.to_f64() > 6.0, "{:?}", w.character(c).unwrap().position);
+}
+
+#[test]
+fn door_stops_on_player_and_resumes() {
+    let mut w = fps_world();
+    let door = doorway(&mut w, true);
+    w.set_door_amount(door, Fx::ONE);
+    // Stand inside the swing area (in front of the open door, on the +z side).
+    let c = w.create_character(&CharacterDesc { position: v(-0.1, 0.95, 5.55), ..Default::default() }).unwrap();
+    walk(&mut w, c, CharacterInput::default(), 5);
+    let start = w.character(c).unwrap().position;
+    w.set_door_open(door, false);
+    walk(&mut w, c, CharacterInput::default(), 60);
+    let d = w.door(door).unwrap();
+    assert!(d.blocked && d.open_fraction() > Fx::ZERO, "door should be held open by the player");
+    let p = w.character(c).unwrap().position;
+    assert_eq!(p, start, "player must not be shoved");
+    // Player leaves; the door finishes closing.
+    walk(&mut w, c, CharacterInput { move_x: Fx::ONE, ..Default::default() }, 60);
+    walk(&mut w, c, CharacterInput::default(), 60);
+    let d = w.door(door).unwrap();
+    assert!(!d.blocked && d.amount == Fx::ZERO);
+}
+
+#[test]
+fn pushing_door_shoves_player_out() {
+    let mut w = fps_world();
+    let door = doorway(&mut w, false);
+    w.set_door_amount(door, Fx::ONE);
+    let c = w.create_character(&CharacterDesc { position: v(-0.1, 0.95, 5.55), ..Default::default() }).unwrap();
+    walk(&mut w, c, CharacterInput::default(), 5);
+    w.set_door_open(door, false);
+    walk(&mut w, c, CharacterInput::default(), 90);
+    assert_eq!(w.door(door).unwrap().amount, Fx::ZERO);
+    // The closed door occupies z in [4.95, 5.05], x in [-0.6, 0.6].
+    let p = w.character(c).unwrap().position;
+    assert!(p.z.to_f64() > 5.05 + 0.39 || p.z.to_f64() < 4.95 - 0.39 || p.x.to_f64().abs() > 0.99, "player inside door: {p:?}");
+}
+
+#[test]
+fn sliding_door_and_rollback() {
+    let mut w = fps_world();
+    let slab = w.add_shape(Shape::cuboid(v(1.0, 1.1, 0.05)));
+    let door = w
+        .create_door(&DoorDesc {
+            shape: slab,
+            kind: DoorKind::Slide,
+            pivot: v(0.0, 1.1, 5.0),
+            axis: Vec3::X,
+            open_amount: f(2.0),
+            speed: f(1.0),
+            ..Default::default()
+        })
+        .unwrap();
+    let box_s = w.add_shape(Shape::cuboid(v(0.2, 0.2, 0.2)));
+    let prop = w.create_body(&BodyDesc::new_dynamic(box_s, v(1.4, 0.2, 5.4), f(2.0))).unwrap();
+    walk(&mut w, CharacterHandle::default(), CharacterInput::default(), 10);
+    w.set_door_open(door, true);
+    let mut snap = Vec::new();
+    walk(&mut w, CharacterHandle::default(), CharacterInput::default(), 30);
+    w.save_snapshot(&mut snap);
+    walk(&mut w, CharacterHandle::default(), CharacterInput::default(), 120);
+    let h = w.state_hash();
+    let d = w.door(door).unwrap();
+    assert_eq!(d.amount, f(2.0));
+    assert_eq!(w.body(d.body()).unwrap().position, v(2.0, 1.1, 5.0));
+    let _ = prop;
+    w.load_snapshot(&snap).unwrap();
+    walk(&mut w, CharacterHandle::default(), CharacterInput::default(), 120);
+    assert_eq!(w.state_hash(), h, "door rollback diverged");
+}

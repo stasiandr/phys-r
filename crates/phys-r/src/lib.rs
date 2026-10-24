@@ -10,7 +10,9 @@
 //!   impulse solver, speculative contacts, friction, restitution, sleeping.
 //! * Static level geometry built from primitives in a BVH (no triangle meshes:
 //!   boxes are faster and every pair has a dedicated routine).
-//! * Kinematic FPS character controller (move & slide, steps, slopes, snap).
+//! * Kinematic FPS character controller (move & slide, steps, slopes, snap,
+//!   crouch, moving platforms, fly/noclip).
+//! * Deterministic hinged / sliding doors that stop on players.
 //! * Raycasts, sphere/capsule casts, overlaps, sensors and contact events.
 //! * Lag compensation (pose history + rewound raycasts).
 //! * Snapshots / restore and state hashing for desync detection.
@@ -24,6 +26,7 @@ pub mod body;
 pub mod bvh;
 pub mod character;
 pub mod collide;
+pub mod door;
 pub mod fixed;
 pub mod geometry;
 pub mod history;
@@ -36,6 +39,7 @@ pub mod world;
 
 pub use body::{flags, Body, BodyDesc, BodyHandle, BodyKind};
 pub use character::{collision, Character, CharacterDesc, CharacterHandle, CharacterInput, MoveMode, MoveResult, MovementSettings};
+pub use door::{Door, DoorDesc, DoorHandle, DoorKind};
 pub use fixed::Fx;
 pub use geometry::Aabb;
 pub use math::{Iso, Mat3, Quat, Vec3};

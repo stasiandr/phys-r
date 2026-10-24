@@ -210,6 +210,35 @@ typedef struct {
     PrVec3 normal;
 } PrEvent;
 
+typedef struct {
+    uint32_t shape;
+    uint32_t kind;  /* PR_DOOR_HINGE (amount in radians) / PR_DOOR_SLIDE (metres) */
+    PrVec3 pivot;   /* hinge: point on axis; slide: closed body centre */
+    PrVec3 axis;    /* hinge axis / slide direction */
+    PrQuat closed_rotation;
+    PrVec3 offset;  /* hinge: closed body centre relative to pivot */
+    pr_fx open_amount;
+    pr_fx speed;
+    pr_fx friction;
+    uint32_t layer;
+    uint32_t mask;
+    uint32_t block_on_characters; /* stop instead of pushing players */
+    uint32_t _pad;
+    uint64_t user_data;
+} PrDoorDesc;
+
+typedef struct {
+    uint64_t body;
+    pr_fx amount;
+    pr_fx target;
+    pr_fx open_fraction; /* 0 closed .. 1 open */
+    uint32_t blocked;
+    uint32_t moving;
+} PrDoorState;
+
+#define PR_DOOR_HINGE 0u
+#define PR_DOOR_SLIDE 1u
+
 uint32_t pr_version(void);
 
 /* World */
@@ -264,6 +293,15 @@ uint32_t pr_character_set_velocity(PrWorld *w, uint64_t character, const PrVec3 
 uint32_t pr_character_add_velocity(PrWorld *w, uint64_t character, const PrVec3 *dv);
 uint32_t pr_character_set_mode(PrWorld *w, uint64_t character, uint32_t mode);
 uint64_t pr_character_of_body(PrWorld *w, uint64_t body);
+
+/* Doors (state is part of snapshots) */
+void pr_door_desc_default(PrDoorDesc *out);
+uint64_t pr_door_create(PrWorld *w, const PrDoorDesc *desc);
+uint32_t pr_door_destroy(PrWorld *w, uint64_t door);
+uint32_t pr_door_set_open(PrWorld *w, uint64_t door, uint32_t open);
+uint32_t pr_door_set_target(PrWorld *w, uint64_t door, pr_fx fraction);
+uint32_t pr_door_set_amount(PrWorld *w, uint64_t door, pr_fx fraction);
+uint32_t pr_door_get_state(PrWorld *w, uint64_t door, PrDoorState *out);
 
 /* Events from the last step */
 uint32_t pr_world_event_count(PrWorld *w);

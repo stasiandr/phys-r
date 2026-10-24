@@ -9,15 +9,16 @@
 
 use crate::body::{Body, BodyHandle, BodyKind};
 use crate::character::{Character, CharacterDesc, CharacterInput, MoveMode, MovementSettings};
+use crate::door::{Door, DoorDesc, DoorKind};
 use crate::fixed::Fx;
 use crate::geometry::Aabb;
-use crate::math::{Quat, Vec3};
+use crate::math::{Iso, Quat, Vec3};
 use crate::shape::ShapeId;
 use crate::solver::{Manifold, ManifoldPoint};
 use crate::world::World;
 
 const MAGIC: u32 = 0x3152_4850; // "PHR1"
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotError {
@@ -168,6 +169,9 @@ impl World {
             w.b(b.sleeping);
             w.fx(b.sleep_time);
             w.u64(b.user_data);
+            w.b(b.has_target);
+            w.v3(b.target.pos);
+            w.q(b.target.rot);
         }
         w.u32(self.free.len() as u32);
         for &f in &self.free {
@@ -253,6 +257,37 @@ impl World {
         for &f in &self.char_free {
             w.u32(f);
         }
+
+        w.u32(self.doors.len() as u32);
+        for d in &self.doors {
+            w.u32(d.generation);
+            w.b(d.alive);
+            if !d.alive {
+                continue;
+            }
+            w.u64(d.body.to_bits());
+            let c = &d.desc;
+            w.u32(c.shape.0);
+            w.u8(c.kind as u8);
+            w.v3(c.pivot);
+            w.v3(c.axis);
+            w.q(c.closed_rotation);
+            w.v3(c.offset);
+            w.fx(c.open_amount);
+            w.fx(c.speed);
+            w.b(c.block_on_characters);
+            w.u8(c.layer);
+            w.u32(c.mask);
+            w.fx(c.friction);
+            w.u64(c.user_data);
+            w.fx(d.amount);
+            w.fx(d.target);
+            w.b(d.blocked);
+        }
+        w.u32(self.door_free.len() as u32);
+        for &f in &self.door_free {
+            w.u32(f);
+        }
     }
 
     /// Restore state from a snapshot produced by [`World::save_snapshot`].
@@ -305,6 +340,8 @@ impl World {
                 sleeping: r.b()?,
                 sleep_time: r.fx()?,
                 user_data: r.u64()?,
+                has_target: r.b()?,
+                target: Iso::new(r.v3()?, r.q()?),
                 aabb: Aabb::EMPTY,
             };
             bodies.push(b);
@@ -441,6 +478,50 @@ impl World {
             char_free.push(r.u32()?);
         }
 
+        let nd = r.len()?;
+        let mut doors = Vec::with_capacity(nd);
+        for _ in 0..nd {
+            let generation = r.u32()?;
+            let alive = r.b()?;
+            if !alive {
+                doors.push(Door {
+                    alive: false,
+                    generation,
+                    body: BodyHandle::INVALID,
+                    desc: DoorDesc::default(),
+                    amount: Fx::ZERO,
+                    target: Fx::ZERO,
+                    blocked: false,
+                });
+                continue;
+            }
+            let body = BodyHandle::from_bits(r.u64()?);
+            let desc = DoorDesc {
+                shape: ShapeId(r.u32()?),
+                kind: DoorKind::from_u8(r.u8()?),
+                pivot: r.v3()?,
+                axis: r.v3()?,
+                closed_rotation: r.q()?,
+                offset: r.v3()?,
+                open_amount: r.fx()?,
+                speed: r.fx()?,
+                block_on_characters: r.b()?,
+                layer: r.u8()?,
+                mask: r.u32()?,
+                friction: r.fx()?,
+                user_data: r.u64()?,
+            };
+            if desc.shape.0 as usize >= self.shapes.len() {
+                return Err(SnapshotError::MissingShape);
+            }
+            doors.push(Door { alive, generation, body, desc, amount: r.fx()?, target: r.fx()?, blocked: r.b()? });
+        }
+        let ndf = r.len()?;
+        let mut door_free = Vec::with_capacity(ndf);
+        for _ in 0..ndf {
+            door_free.push(r.u32()?);
+        }
+
         // Validate indices before committing.
         let nbodies = bodies.len() as u32;
         if manifolds.iter().any(|m| m.a >= nbodies || m.b >= nbodies)
@@ -458,6 +539,8 @@ impl World {
         self.sensor_pairs = sensor_pairs;
         self.characters = characters;
         self.char_free = char_free;
+        self.doors = doors;
+        self.door_free = door_free;
         self.events.clear();
         // Derived data.
         for b in self.bodies.iter_mut() {

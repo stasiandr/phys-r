@@ -17,6 +17,7 @@ Fast, **deterministic** 3D physics in Rust for **networked first-person shooters
 | Events | Contact begin/end, sensor (trigger) enter/exit |
 | Queries | Raycast (closest hit, with body-local hit point for headshots), sphere cast, capsule cast, sphere/shape overlap, layer masks, exclusion |
 | Character | See below |
+| Doors | Hinged or sliding, open/close/partial targets at a fixed speed, exact kinematic poses, stop on players or push them; state is in snapshots |
 | Netcode | `save_snapshot` / `load_snapshot`, `state_hash`, single-character `simulate_character` for prediction/replay, pose history plus `raycast_rewind` for lag compensation |
 
 ### FPS character controller
@@ -84,6 +85,7 @@ world.load_snapshot(&snap)?;
    - **`PhysRWorld`**: one per scene. It owns the world, runs the fixed tick (or set `autoSimulate = false` and call `Tick()` from your netcode) and interpolates visuals.
    - **`PhysRStaticGeometry`**: put the level under it. It bakes every Box/Sphere/Capsule collider (triggers become sensors) into static bodies.
    - **`PhysRBody`**: dynamic and kinematic props.
+   - **`PhysRDoor`**: doors (hinge side or slide). Call `Open()`/`Close()` from simulated game logic.
    - **`PhysRCharacter`**: players. Set `NextInput` every tick. See `Samples~/FpsBasic/SimpleFpsPlayer.cs` for quantized network input, crouch-aware eye height and headshot detection.
 
 Determinism rules on the C# side:
@@ -96,6 +98,20 @@ Determinism rules on the C# side:
 - Shapes and settings are configuration: register them identically on every peer. Bodies are created sorted by `(creationOrder, hierarchy path)`.
 
 ## Performance
+
+### Target map: 5000 static colliders, 20 doors, 16 players
+
+Run `cargo run --release -p phys-r --example fps_map`. The scene has 400 floor tiles plus 4600 walls, crates, pillars, capsules and ramps (a third of them rotated), 20 hinged doors opening and closing, 16 players running, jumping and crouching, and 32 hitscan rays per tick.
+
+| | x86_64 container |
+|---|---:|
+| Level build (BVH, once at load) | ~11 ms |
+| Step (doors + 16 players) | ~40–48 µs avg |
+| Raycast across the map | ~0.9–1 µs |
+
+Thousands of static colliders cost almost nothing per tick. They sit in an SAH BVH, and every per-tick loop only visits moving bodies. Characters and doors query static geometry only through their own sweeps.
+
+### Prop-heavy worst case
 
 Run `cargo run --release -p phys-r --example bench`. The scene is a 32×32 tiled box level with 300 cover boxes, N props, 16–32 characters (moving and jumping), 64–128 raycasts per tick, and sleeping disabled (worst case).
 

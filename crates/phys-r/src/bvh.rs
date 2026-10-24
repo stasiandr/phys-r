@@ -157,37 +157,40 @@ impl Bvh {
         }
     }
 
-    /// Ray traversal. `f(id, max_t)` returns `Some(t)` to shrink the ray.
-    /// Children are visited near-first so closest-hit queries cull early.
+    /// Ray traversal. `f(id, enter_t, max_t)` is called for items whose box
+    /// the ray enters before `max_t` (`enter_t` is that entry distance) and
+    /// returns `Some(t)` to shrink the ray. Children are visited near-first and
+    /// every box is tested exactly once.
     #[inline]
-    pub fn raycast(&self, ray: &Ray, mut max_t: Fx, mut f: impl FnMut(u32, Fx) -> Option<Fx>) -> Fx {
+    pub fn raycast(&self, ray: &Ray, mut max_t: Fx, mut f: impl FnMut(u32, Fx, Fx) -> Option<Fx>) -> Fx {
         if self.nodes.is_empty() {
             return max_t;
         }
-        let mut stack = [0u32; STACK];
+        let Some(t_root) = self.nodes[0].aabb.ray_test(ray, max_t) else { return max_t };
+        let mut stack = [(0u32, Fx::ZERO); STACK];
+        stack[0] = (0, t_root);
         let mut sp = 1;
         while sp > 0 {
             sp -= 1;
-            let idx = stack[sp] as usize;
-            let node = &self.nodes[idx];
-            if node.aabb.ray_test(ray, max_t).is_none() {
+            let (idx, t_enter) = stack[sp];
+            // The ray may have been shortened since this node was pushed.
+            if t_enter > max_t {
                 continue;
             }
+            let node = &self.nodes[idx as usize];
             if node.count > 0 {
                 let s = node.offset as usize;
                 let e = s + node.count as usize;
                 for (&id, a) in self.items[s..e].iter().zip(&self.item_aabbs[s..e]) {
-                    if a.ray_test(ray, max_t).is_none() {
-                        continue;
-                    }
-                    if let Some(t) = f(id, max_t) {
+                    let Some(enter) = a.ray_test(ray, max_t) else { continue };
+                    if let Some(t) = f(id, enter, max_t) {
                         if t < max_t {
                             max_t = t;
                         }
                     }
                 }
             } else if sp + 2 <= STACK {
-                let l = idx as u32 + 1;
+                let l = idx + 1;
                 let r = node.offset;
                 let tl = self.nodes[l as usize].aabb.ray_test(ray, max_t);
                 let tr = self.nodes[r as usize].aabb.ray_test(ray, max_t);
@@ -195,20 +198,20 @@ impl Bvh {
                     (Some(a), Some(b)) => {
                         // Push the farther child first so the nearer pops first.
                         if a <= b {
-                            stack[sp] = r;
-                            stack[sp + 1] = l;
+                            stack[sp] = (r, b);
+                            stack[sp + 1] = (l, a);
                         } else {
-                            stack[sp] = l;
-                            stack[sp + 1] = r;
+                            stack[sp] = (l, a);
+                            stack[sp + 1] = (r, b);
                         }
                         sp += 2;
                     }
-                    (Some(_), None) => {
-                        stack[sp] = l;
+                    (Some(a), None) => {
+                        stack[sp] = (l, a);
                         sp += 1;
                     }
-                    (None, Some(_)) => {
-                        stack[sp] = r;
+                    (None, Some(b)) => {
+                        stack[sp] = (r, b);
                         sp += 1;
                     }
                     (None, None) => {}
@@ -240,9 +243,10 @@ fn sah_split(work: &mut [(u32, Aabb)], cb: &Aabb) -> Option<usize> {
         if ext <= 0 {
             continue;
         }
+        let width = ext / BINS as i64 + 1;
         let bin_of = |a: &Aabb| -> usize {
             let c = (a.min.get(axis).0 >> 1) + (a.max.get(axis).0 >> 1) - lo;
-            (((c.max(0) as i128) * BINS as i128 / (ext as i128 + 1)) as usize).min(BINS - 1)
+            ((c.max(0) / width) as usize).min(BINS - 1)
         };
         let mut counts = [0usize; BINS];
         let mut boxes = [Aabb::EMPTY; BINS];
@@ -280,10 +284,10 @@ fn sah_split(work: &mut [(u32, Aabb)], cb: &Aabb) -> Option<usize> {
     let (_, axis, split) = best?;
     let lo = cb.min.get(axis).0;
     let ext = cb.max.get(axis).0 - lo;
+    let width = ext / BINS as i64 + 1;
     let key = |a: &Aabb| -> (usize, i64) {
         let c = (a.min.get(axis).0 >> 1) + (a.max.get(axis).0 >> 1);
-        let bin = (((c - lo).max(0) as i128 * BINS as i128 / (ext as i128 + 1)) as usize).min(BINS - 1);
-        (bin, c)
+        ((((c - lo).max(0) / width) as usize).min(BINS - 1), c)
     };
     work.sort_unstable_by_key(|(id, a)| (key(a), *id));
     let mid = work.iter().position(|(_, a)| key(a).0 >= split).unwrap_or(n / 2);

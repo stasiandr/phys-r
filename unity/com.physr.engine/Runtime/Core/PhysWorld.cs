@@ -182,6 +182,26 @@ namespace PhysR
         public CharacterHandle CharacterOfBody(BodyHandle body) { return new CharacterHandle(PhysRNative.pr_character_of_body(Ptr, body.Value)); }
 
         // ------------------------------------------------------------------
+        // Doors (state is part of snapshots)
+        // ------------------------------------------------------------------
+
+        public DoorHandle CreateDoor(DoorDesc desc) { return new DoorHandle(PhysRNative.pr_door_create(Ptr, ref desc)); }
+        public bool DestroyDoor(DoorHandle h) { return PhysRNative.pr_door_destroy(Ptr, h.Value) != 0; }
+        /// <summary>Start opening (true) or closing (false).</summary>
+        public bool SetDoorOpen(DoorHandle h, bool open) { return PhysRNative.pr_door_set_open(Ptr, h.Value, open ? 1u : 0u) != 0; }
+        /// <summary>Move toward a partial opening (0 = closed .. 1 = open).</summary>
+        public bool SetDoorTarget(DoorHandle h, FP fraction) { return PhysRNative.pr_door_set_target(Ptr, h.Value, fraction.Raw) != 0; }
+        /// <summary>Snap instantly to an opening (0..1).</summary>
+        public bool SetDoorAmount(DoorHandle h, FP fraction) { return PhysRNative.pr_door_set_amount(Ptr, h.Value, fraction.Raw) != 0; }
+
+        public DoorState GetState(DoorHandle h)
+        {
+            DoorState s;
+            PhysRNative.pr_door_get_state(Ptr, h.Value, out s);
+            return s;
+        }
+
+        // ------------------------------------------------------------------
         // Events
         // ------------------------------------------------------------------
 

@@ -78,6 +78,22 @@ static class Test {
             var q = FPQuaternion.FromYaw(FP.HalfPi);
             var f = q * FPVector3.Forward;
             Check(FP.Abs(f.X - FP.One) < FP.FromRatio(1, 10000), "yaw rotate " + f);
+            // Doors: hinge opens to exactly its open pose; state round-trips via snapshot.
+            var dd = DoorDesc.Default;
+            dd.Shape = world.AddBox(new FPVector3(FP.FromRatio(6, 10), FP.FromRatio(11, 10), FP.FromRatio(5, 100)));
+            dd.Pivot = new FPVector3(10, 2, 10);
+            dd.Offset = new FPVector3(FP.FromRatio(6, 10), FP.Zero, FP.Zero);
+            var door = world.CreateDoor(dd);
+            Check(door.IsValid, "door create");
+            world.SetDoorOpen(door, true);
+            var dsnap = world.SaveSnapshot();
+            world.Step(60);
+            var ds = world.GetState(door);
+            Check(ds.Moving == 0 && ds.OpenFraction == FP.One, "door open " + ds.OpenFraction);
+            ulong dh = world.StateHash();
+            world.LoadSnapshot(dsnap);
+            world.Step(60);
+            Check(world.StateHash() == dh, "door rollback");
             Console.WriteLine("hash " + h.ToString("x16"));
         }
         Console.WriteLine(fails == 0 ? "ALL OK" : ("FAILURES: " + fails));

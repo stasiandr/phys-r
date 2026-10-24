@@ -102,9 +102,13 @@ pub struct World {
     pub(crate) sensor_pairs: Vec<(u32, u32)>,
     pub(crate) characters: Vec<Character>,
     pub(crate) char_free: Vec<u32>,
+    pub(crate) doors: Vec<crate::door::Door>,
+    pub(crate) door_free: Vec<u32>,
 
     // Derived / scratch state.
     pub(crate) static_bvh: Bvh,
+    /// Subset of `static_bvh` holding only static sensors.
+    static_sensor_bvh: Bvh,
     pub(crate) static_dirty: bool,
     pub(crate) movers: Vec<u32>,
     movers_dirty: bool,
@@ -120,6 +124,7 @@ pub struct World {
     uf_parent: Vec<u32>,
     uf_sleep: Vec<Fx>,
     pseudo: Vec<(Vec3, Vec3)>,
+    solver_touched: Vec<u32>,
     pub(crate) events: Vec<Event>,
     pub(crate) history: History,
     pub(crate) scratch_obstacles: Vec<crate::query::ObRef>,
@@ -147,7 +152,10 @@ impl World {
             sensor_pairs: Vec::new(),
             characters: Vec::new(),
             char_free: Vec::new(),
+            doors: Vec::new(),
+            door_free: Vec::new(),
             static_bvh: Bvh::default(),
+            static_sensor_bvh: Bvh::default(),
             static_dirty: true,
             movers: Vec::new(),
             movers_dirty: true,
@@ -161,6 +169,7 @@ impl World {
             uf_parent: Vec::new(),
             uf_sleep: Vec::new(),
             pseudo: Vec::new(),
+            solver_touched: Vec::new(),
             events: Vec::new(),
             history,
             scratch_obstacles: Vec::new(),
@@ -244,6 +253,8 @@ impl World {
             sleeping: false,
             sleep_time: Fx::ZERO,
             user_data: d.user_data,
+            has_target: false,
+            target: Iso::IDENTITY,
             aabb,
         };
         if d.kind == BodyKind::Static {
@@ -349,6 +360,17 @@ impl World {
         true
     }
 
+    /// Change body flags (keeps internal flags). Static bodies are re-indexed
+    /// so e.g. turning a collider into a trigger takes effect.
+    pub fn set_body_flags(&mut self, h: BodyHandle, flags: u32) -> bool {
+        let Some(b) = self.body_mut(h) else { return false };
+        b.flags = (b.flags & flags::CHARACTER) | (flags & !flags::CHARACTER);
+        if b.is_static() {
+            self.static_dirty = true;
+        }
+        true
+    }
+
     pub fn set_velocity(&mut self, h: BodyHandle, linear: Vec3, angular: Vec3) -> bool {
         match self.body_mut(h) {
             Some(b) if !b.is_static() => {
@@ -362,12 +384,17 @@ impl World {
         }
     }
 
-    /// Kinematic bodies: set the velocity needed to reach a target pose by the
-    /// end of the next step.
+    /// Kinematic bodies: reach exactly this pose at the end of the next step
+    /// (the implied velocity pushes dynamic bodies). Call every tick for
+    /// continuous motion; without a new target the body stops.
     pub fn set_kinematic_target(&mut self, h: BodyHandle, position: Vec3, rotation: Quat) -> bool {
         let inv_dt = Fx::ONE / self.settings.dt;
         match self.body_mut(h) {
             Some(b) if b.kind == BodyKind::Kinematic => {
+                // Velocities let the solver push props; the exact pose is
+                // snapped at the end of the step (no integration drift).
+                b.has_target = true;
+                b.target = Iso::new(position, rotation.normalize());
                 b.linear_velocity = (position - b.position).scale(inv_dt);
                 // Angular velocity from the relative rotation (small-angle).
                 let mut dq = rotation.normalize().mul(b.rotation.conjugate());
@@ -442,8 +469,11 @@ impl World {
     }
 
     fn wake_in_aabb(&mut self, aabb: &Aabb) {
-        for b in self.bodies.iter_mut() {
-            if b.alive && b.is_dynamic() && b.sleeping && b.aabb.overlaps(aabb) {
+        // Only moving bodies can sleep (keeps level loading O(n)).
+        self.rebuild_movers();
+        for &i in &self.movers {
+            let b = &mut self.bodies[i as usize];
+            if b.is_dynamic() && b.sleeping && b.aabb.overlaps(aabb) {
                 b.sleeping = false;
                 b.sleep_time = Fx::ZERO;
             }
@@ -469,13 +499,18 @@ impl World {
         self.events.clear();
         let dt = self.settings.dt;
 
-        // 1. Characters move first (kinematic, query-based).
+        // 1. Doors pick their next pose (reached exactly at the end of the
+        //    step), then characters move (kinematic, query-based).
+        self.step_doors(dt);
         self.step_characters(dt);
 
-        // 2. Integrate velocities.
+        // 2. Integrate velocities. (Per-tick loops only visit moving bodies, so
+        // thousands of static colliders cost nothing here.)
+        self.rebuild_movers();
         let g = self.settings.gravity;
-        for b in self.bodies.iter_mut() {
-            if !b.alive || !b.is_dynamic() || b.sleeping {
+        for &i in &self.movers {
+            let b = &mut self.bodies[i as usize];
+            if !b.is_dynamic() || b.sleeping {
                 continue;
             }
             let mut v = b.linear_velocity + (g.scale(b.gravity_scale) + b.force.scale(b.inv_mass)).scale(dt);
@@ -504,15 +539,28 @@ impl World {
         self.solve(dt);
 
         // 5. Integrate positions.
-        for (i, b) in self.bodies.iter_mut().enumerate() {
-            if !b.alive || b.is_static() || b.sleeping {
+        for &i in &self.movers {
+            let b = &mut self.bodies[i as usize];
+            if b.sleeping {
                 continue;
             }
-            let (vp, wp) = self.pseudo.get(i).copied().unwrap_or_default();
+            let (vp, wp) = self.pseudo[i as usize];
             b.position += (b.linear_velocity + vp).scale(dt);
             b.rotation = b.rotation.integrate(b.angular_velocity + wp, dt);
             b.force = Vec3::ZERO;
             b.torque = Vec3::ZERO;
+        }
+        for &i in &self.movers {
+            let b = &mut self.bodies[i as usize];
+            if b.has_target {
+                // Targets are per tick: arrive exactly, then stop unless a
+                // new target is set before the next step.
+                b.position = b.target.pos;
+                b.rotation = b.target.rot;
+                b.has_target = false;
+                b.linear_velocity = Vec3::ZERO;
+                b.angular_velocity = Vec3::ZERO;
+            }
         }
         self.sync_character_bodies();
 
@@ -569,14 +617,21 @@ impl World {
     pub(crate) fn rebuild_static(&mut self) {
         let mut aabbs = Vec::new();
         let mut ids = Vec::new();
+        let mut sensor_aabbs = Vec::new();
+        let mut sensor_ids = Vec::new();
         for (i, b) in self.bodies.iter_mut().enumerate() {
             if b.alive && b.is_static() {
                 b.aabb = self.shapes[b.shape.0 as usize].aabb(&b.iso());
                 aabbs.push(b.aabb);
                 ids.push(i as u32);
+                if b.is_sensor() {
+                    sensor_aabbs.push(b.aabb);
+                    sensor_ids.push(i as u32);
+                }
             }
         }
         self.static_bvh = Bvh::build_with_ids(&aabbs, ids);
+        self.static_sensor_bvh = Bvh::build_with_ids(&sensor_aabbs, sensor_ids);
         self.static_dirty = false;
     }
 
@@ -600,11 +655,12 @@ impl World {
     }
 
     /// Ray traversal over moving bodies; `f(id, max_t)` may shrink the ray.
-    pub(crate) fn raycast_movers(&self, ray: &crate::geometry::Ray, max_t: Fx, mut f: impl FnMut(u32, Fx) -> Option<Fx>) -> Fx {
+    pub(crate) fn raycast_movers(&self, ray: &crate::geometry::Ray, max_t: Fx, mut f: impl FnMut(u32, Fx, Fx) -> Option<Fx>) -> Fx {
         if self.movers.len() < MOVER_BVH_MIN {
             let mut t = max_t;
             for &i in &self.movers {
-                if let Some(h) = f(i, t) {
+                let Some(enter) = self.bodies[i as usize].aabb.ray_test(ray, t) else { continue };
+                if let Some(h) = f(i, enter, t) {
                     t = t.min(h);
                 }
             }
@@ -705,7 +761,10 @@ impl World {
             let a_sensor = a.is_sensor();
             let a_dyn = a.is_dynamic();
             let pairs = &mut self.pairs;
-            self.static_bvh.query_aabb(&a.aabb, |is| {
+            // Kinematic bodies (characters, doors) only care about static
+            // triggers; skip the full level tree for them.
+            let tree = if a_dyn || a_sensor { &self.static_bvh } else { &self.static_sensor_bvh };
+            tree.query_aabb(&a.aabb, |is| {
                 let s = &bodies[is as usize];
                 if !s.aabb.overlaps(&a.aabb) || !layers_interact(la, ma, s.layer, s.mask) {
                     return;
@@ -861,10 +920,20 @@ impl World {
             restitution_threshold: self.settings.restitution_threshold,
         };
         self.solver.reset();
-        self.pseudo.clear();
-        self.pseudo.resize(self.bodies.len(), (Vec3::ZERO, Vec3::ZERO));
-        self.solver_index.clear();
-        self.solver_index.resize(self.bodies.len(), NO_INDEX);
+        // Sparse reset: only entries touched last step are dirty.
+        let n = self.bodies.len();
+        if self.pseudo.len() != n {
+            self.pseudo.clear();
+            self.pseudo.resize(n, (Vec3::ZERO, Vec3::ZERO));
+            self.solver_index.clear();
+            self.solver_index.resize(n, NO_INDEX);
+        } else {
+            for &i in &self.solver_touched {
+                self.pseudo[i as usize] = (Vec3::ZERO, Vec3::ZERO);
+                self.solver_index[i as usize] = NO_INDEX;
+            }
+        }
+        self.solver_touched.clear();
         for mi in 0..self.manifolds.len() {
             let m = self.manifolds[mi];
             let sa = self.solver_body(m.a);
@@ -884,7 +953,9 @@ impl World {
         self.solver.solve_positions(self.settings.position_iterations);
         self.solver.store_impulses(&mut self.manifolds);
         // Write velocities back.
-        for (i, &si) in self.solver_index.iter().enumerate() {
+        for &i in &self.solver_touched {
+            let i = i as usize;
+            let si = self.solver_index[i];
             if si != NO_INDEX && si != 0 {
                 let b = &mut self.bodies[i];
                 if b.is_dynamic() {
@@ -914,18 +985,26 @@ impl World {
             }
         };
         self.solver_index[i as usize] = si;
+        self.solver_touched.push(i);
         si
     }
 
     #[inline(never)]
     fn update_sleep(&mut self, dt: Fx) {
         let n = self.bodies.len();
-        self.uf_parent.clear();
-        self.uf_parent.extend(0..n as u32);
+        if self.uf_parent.len() != n {
+            self.uf_parent.resize(n, 0);
+            self.uf_sleep.resize(n, Fx::MAX);
+        }
         let lin2 = self.settings.sleep_linear_threshold * self.settings.sleep_linear_threshold;
         let ang2 = self.settings.sleep_angular_threshold * self.settings.sleep_angular_threshold;
-        for b in self.bodies.iter_mut() {
-            if !b.alive || !b.is_dynamic() || b.sleeping {
+        // Union-find over moving bodies only. Roots end up as the minimum
+        // index of each island regardless of visiting order (deterministic).
+        for &i in &self.movers {
+            self.uf_parent[i as usize] = i;
+            self.uf_sleep[i as usize] = Fx::MAX;
+            let b = &mut self.bodies[i as usize];
+            if !b.is_dynamic() || b.sleeping {
                 continue;
             }
             if b.flags & flags::NO_SLEEP == 0 && b.linear_velocity.length_sq() < lin2 && b.angular_velocity.length_sq() < ang2 {
@@ -950,20 +1029,20 @@ impl World {
                 }
             }
         }
-        self.uf_sleep.clear();
-        self.uf_sleep.resize(n, Fx::MAX);
-        for i in 0..n {
-            let b = &self.bodies[i];
-            if b.alive && b.is_dynamic() && !b.sleeping {
-                let r = uf_find(&mut self.uf_parent, i as u32) as usize;
+        for k in 0..self.movers.len() {
+            let i = self.movers[k];
+            let b = &self.bodies[i as usize];
+            if b.is_dynamic() && !b.sleeping {
+                let r = uf_find(&mut self.uf_parent, i) as usize;
                 self.uf_sleep[r] = self.uf_sleep[r].min(b.sleep_time);
             }
         }
         let tts = self.settings.time_to_sleep;
-        for i in 0..n {
-            let r = uf_find(&mut self.uf_parent, i as u32) as usize;
-            let b = &mut self.bodies[i];
-            if b.alive && b.is_dynamic() && !b.sleeping && self.uf_sleep[r] >= tts {
+        for k in 0..self.movers.len() {
+            let i = self.movers[k];
+            let r = uf_find(&mut self.uf_parent, i) as usize;
+            let b = &mut self.bodies[i as usize];
+            if b.is_dynamic() && !b.sleeping && self.uf_sleep[r] >= tts {
                 b.sleeping = true;
                 b.linear_velocity = Vec3::ZERO;
                 b.angular_velocity = Vec3::ZERO;

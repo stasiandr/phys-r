@@ -1,7 +1,7 @@
 //! Cross-platform determinism check.
 //!
 //! Runs a scenario exercising every subsystem (tiled box level, stacked boxes,
-//! spheres, capsules, CCD, sensors, characters with jumping / strafing /
+//! spheres, capsules, CCD, sensors, hinged and sliding doors, characters with jumping / strafing /
 //! steps, raycasts, rewinds, snapshots) and compares the final state hash
 //! against a golden value. Every supported target (x86_64, i686, aarch64,
 //! armv7, wasm, ...) must produce exactly this hash; CI runs this test on
@@ -12,7 +12,7 @@
 
 use phys_r::*;
 
-const GOLDEN: u64 = 0x079e_8bb6_06d1_2938;
+const GOLDEN: u64 = 0xa5e5_555d_d8fc_c9a4;
 
 fn f(v: f64) -> Fx {
     Fx::from_f64(v)
@@ -68,6 +68,22 @@ fn scenario() -> (u64, Vec<u64>) {
         .unwrap();
     let _ = bullet;
 
+    let slab = w.add_shape(Shape::cuboid(v(0.6, 1.1, 0.05)));
+    let doors = [
+        w.create_door(&DoorDesc { shape: slab, pivot: v(-3.0, 1.2, 1.0), offset: v(0.6, 0.0, 0.0), ..Default::default() }).unwrap(),
+        w.create_door(&DoorDesc {
+            shape: slab,
+            kind: DoorKind::Slide,
+            pivot: v(1.0, 1.2, -4.0),
+            axis: Vec3::X,
+            open_amount: f(1.2),
+            speed: f(1.5),
+            block_on_characters: false,
+            ..Default::default()
+        })
+        .unwrap(),
+    ];
+
     let mut chars = Vec::new();
     for i in 0..4 {
         chars.push(w.create_character(&CharacterDesc { position: v(-6.0 + i as f64 * 1.5, 1.2, -1.0), ..Default::default() }).unwrap());
@@ -87,6 +103,9 @@ fn scenario() -> (u64, Vec<u64>) {
                 move_y: Fx::ZERO,
             };
             w.set_character_input(*c, input);
+        }
+        for (k, d) in doors.iter().enumerate() {
+            w.set_door_open(*d, (t / (70 + k as u32 * 25)) % 2 == 0);
         }
         w.step();
         if t == 120 {
@@ -130,6 +149,9 @@ fn scenario() -> (u64, Vec<u64>) {
                 move_y: Fx::ZERO,
             };
             w.set_character_input(*c, input);
+        }
+        for (k, d) in doors.iter().enumerate() {
+            w.set_door_open(*d, (t / (70 + k as u32 * 25)) % 2 == 0);
         }
         w.step();
     }
